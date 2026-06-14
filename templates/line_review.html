@@ -5,65 +5,73 @@
   <title>LINE 行程審核 MVP</title>
   <style>
     :root {
-      --bg: #f4efe4;
-      --panel: #fffdf8;
-      --ink: #1f2b25;
-      --accent: #246a4b;
-      --line: #dbcdb7;
+      --bg: #efe3c8;
+      --panel: #fffaf0;
+      --ink: #243126;
+      --accent: #2b7a52;
+      --line: #d8c5a4;
+      --muted: #6c7268;
       --warn: #8a5b19;
     }
+    * { box-sizing: border-box; }
     body {
       margin: 0;
       font-family: "Noto Sans TC", "Microsoft JhengHei", sans-serif;
-      background: linear-gradient(180deg, #ece4d5 0%, var(--bg) 50%, #f7f2e9 100%);
+      background:
+        radial-gradient(circle at top left, #f8efd9 0, transparent 28%),
+        radial-gradient(circle at top right, #ead9b2 0, transparent 22%),
+        linear-gradient(180deg, #e8d9bb 0%, var(--bg) 45%, #f7f1e2 100%);
       color: var(--ink);
     }
     main {
-      max-width: 1080px;
+      max-width: 1180px;
       margin: 0 auto;
-      padding: 24px;
+      padding: 28px 20px 48px;
     }
     h1 {
-      margin: 0 0 8px;
-      font-size: 32px;
+      margin: 0 0 10px;
+      font-size: 28px;
+    }
+    h2 {
+      margin: 0 0 12px;
+      font-size: 20px;
     }
     .hint {
-      margin-bottom: 20px;
-      color: #5c665f;
+      color: var(--muted);
+      margin-bottom: 18px;
+      line-height: 1.6;
     }
     .card {
-      background: var(--panel);
+      background: rgba(255, 250, 240, 0.96);
       border: 1px solid var(--line);
-      border-radius: 18px;
+      border-radius: 20px;
       padding: 18px;
       margin-bottom: 18px;
-      box-shadow: 0 10px 30px rgba(60, 54, 42, 0.08);
+      box-shadow: 0 10px 30px rgba(75, 58, 26, 0.08);
     }
     .meta {
       display: flex;
-      gap: 10px;
       flex-wrap: wrap;
-      margin-bottom: 10px;
+      gap: 10px;
+      margin-bottom: 12px;
       font-size: 13px;
-      color: #5c665f;
+      color: var(--muted);
     }
     .pill {
       border-radius: 999px;
       padding: 4px 10px;
-      background: #edf5ef;
+      background: #edf6ef;
       color: var(--accent);
+      font-weight: 700;
     }
-    pre {
-      white-space: pre-wrap;
-      background: #f8f4ec;
-      border-radius: 12px;
-      padding: 12px;
-      border: 1px solid #eadfcd;
+    .stack {
+      display: grid;
+      gap: 12px;
     }
     table {
       width: 100%;
       border-collapse: collapse;
-      margin-top: 10px;
+      margin-top: 8px;
     }
     th, td {
       border-bottom: 1px solid #eadfcd;
@@ -72,39 +80,114 @@
       vertical-align: top;
       font-size: 14px;
     }
+    th {
+      color: #394339;
+    }
+    pre, textarea {
+      width: 100%;
+      white-space: pre-wrap;
+      background: #fbf6ed;
+      border-radius: 14px;
+      padding: 12px;
+      border: 1px solid #eadfcd;
+      font: inherit;
+      color: inherit;
+    }
+    textarea {
+      min-height: 120px;
+      resize: vertical;
+    }
+    .controls {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      align-items: center;
+    }
     form {
-      margin-top: 12px;
+      margin: 0;
     }
     input, button, select {
       font: inherit;
-      padding: 8px 10px;
-      border-radius: 10px;
+      padding: 10px 12px;
+      border-radius: 12px;
       border: 1px solid #ccbca4;
     }
-    input {
-      min-width: 420px;
-      max-width: 100%;
+    input[type="text"], input[type="file"] {
+      width: min(100%, 460px);
+      background: white;
+    }
+    select {
+      background: white;
     }
     button {
       background: var(--accent);
       color: white;
       cursor: pointer;
+      border-color: var(--accent);
+      font-weight: 700;
     }
     .secondary {
-      background: #f2eadb;
-      color: #38443c;
+      background: #f4ead7;
+      border-color: #d7c2a2;
+      color: #314136;
     }
     .error {
       color: var(--warn);
-      margin-top: 10px;
+      margin-top: 8px;
       white-space: pre-wrap;
+    }
+    .grid {
+      display: grid;
+      gap: 10px;
+    }
+    .preview-grid {
+      display: grid;
+      gap: 12px;
+      margin-top: 14px;
+    }
+    .preview-grid img {
+      max-width: 100%;
+      border-radius: 14px;
+      border: 1px solid #d9c6a4;
+      background: white;
+    }
+    .link-row {
+      display: flex;
+      gap: 12px;
+      flex-wrap: wrap;
+      margin-top: 10px;
+    }
+    .link-row a {
+      color: var(--accent);
+      font-weight: 700;
+      text-decoration: none;
+    }
+    @media (min-width: 900px) {
+      .grid {
+        grid-template-columns: 1.1fr 1fr;
+      }
+      .preview-grid {
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+      }
     }
   </style>
 </head>
 <body>
   <main>
     <h1>LINE 行程審核 MVP</h1>
-    <div class="hint">這裡會列出從 LINE Official Account webhook 收到的訊息，先人工確認，再決定是否寫入 Word。</div>
+    <div class="hint">這裡會列出從 LINE Official Account webhook 收到的訊息，也可以手動貼文字、上傳圖片或檔案轉文字，再人工確認後套用到 Word。台北市地址會自動補一段海山站出發的捷運＋步行指引草稿。</div>
+
+    <section class="card">
+      <h2>手動新增訊息或附件</h2>
+      <form class="stack" action="/messages/create" method="post" enctype="multipart/form-data">
+        <textarea name="raw_text" placeholder="可直接貼老闆訊息，例如：4/20 下午4點會勘，地點台北市大安區復興南路一段253巷32號，請安排。"></textarea>
+        <div class="controls">
+          <input type="file" name="attachment" accept=".txt,.md,.csv,.docx,.pdf,.png,.jpg,.jpeg,.webp,.bmp">
+          <button type="submit">建立解析項目</button>
+        </div>
+      </form>
+    </section>
+
     {% for message in messages %}
       <section class="card">
         <div class="meta">
@@ -113,7 +196,9 @@
           <span>{{ message.source_type }}</span>
           <span>{{ message.sender_id }}</span>
         </div>
+
         <pre>{{ message.raw_text }}</pre>
+
         <table>
           <thead>
             <tr>
@@ -135,41 +220,72 @@
                 <td>{{ action.event }}</td>
                 <td>{{ action.address }}</td>
                 <td>{{ action.note }}</td>
-                <td>{{ action.confidence }}</td>
+                <td>{{ "%.2f"|format(action.confidence) }}</td>
+              </tr>
+            {% else %}
+              <tr>
+                <td colspan="7">目前還沒解析出可套用的行程。</td>
               </tr>
             {% endfor %}
           </tbody>
         </table>
 
-        <form action="/review/{{ message.id }}/refresh" method="post">
-          <button class="secondary" type="submit">重新解析</button>
-        </form>
+        <div class="grid" style="margin-top: 14px;">
+          <form class="stack" action="/review/{{ message.id }}/attachment" method="post" enctype="multipart/form-data">
+            <strong>補充附件轉文字</strong>
+            <div class="controls">
+              <input type="file" name="attachment" accept=".txt,.md,.csv,.docx,.pdf,.png,.jpg,.jpeg,.webp,.bmp" required>
+              <button class="secondary" type="submit">加入附件文字並重解析</button>
+            </div>
+          </form>
 
-        <form action="/review/{{ message.id }}/status" method="post">
-          <select name="status">
-            <option value="pending">pending</option>
-            <option value="applied">applied</option>
-            <option value="approved">approved</option>
-            <option value="skipped">skipped</option>
-            <option value="error">error</option>
-          </select>
-          <button class="secondary" type="submit">更新狀態</button>
-        </form>
+          <form class="stack" action="/review/{{ message.id }}/apply" method="post" enctype="multipart/form-data">
+            <strong>套用到 Word</strong>
+            <input type="text" name="docx_path" value="{{ default_docx_path }}" placeholder="輸入 Render 可讀取的 .docx 路徑，或直接上傳">
+            <div class="controls">
+              <input type="file" name="docx_file" accept=".docx">
+              <button type="submit">套用到 Word</button>
+            </div>
+          </form>
+        </div>
 
-        <form action="/review/{{ message.id }}/apply" method="post">
-          <input name="docx_path" value="{{ default_docx_path }}" placeholder="請輸入可讀取的 Word 檔路徑">
-          <button type="submit">套用到 Word</button>
-        </form>
+        <div class="controls" style="margin-top: 14px;">
+          <form action="/review/{{ message.id }}/refresh" method="post">
+            <button class="secondary" type="submit">重新解析</button>
+          </form>
 
-        {% if message.output_path %}
-          <div class="error">輸出檔案：{{ message.output_path }}</div>
+          <form class="controls" action="/review/{{ message.id }}/status" method="post">
+            <select name="status">
+              <option value="pending" {% if message.status == "pending" %}selected{% endif %}>pending</option>
+              <option value="approved" {% if message.status == "approved" %}selected{% endif %}>approved</option>
+              <option value="applied" {% if message.status == "applied" %}selected{% endif %}>applied</option>
+              <option value="skipped" {% if message.status == "skipped" %}selected{% endif %}>skipped</option>
+              <option value="error" {% if message.status == "error" %}selected{% endif %}>error</option>
+            </select>
+            <button class="secondary" type="submit">更新狀態</button>
+          </form>
+        </div>
+
+        {% if message.output_url %}
+          <div class="link-row">
+            <a href="{{ message.output_url }}" target="_blank" rel="noreferrer">下載輸出 Word</a>
+          </div>
         {% endif %}
+
+        {% if message.preview_urls %}
+          <div class="preview-grid">
+            {% for preview_url in message.preview_urls %}
+              <img src="{{ preview_url }}" alt="Word 預覽圖">
+            {% endfor %}
+          </div>
+        {% endif %}
+
         {% if message.error %}
           <div class="error">{{ message.error }}</div>
         {% endif %}
       </section>
     {% else %}
-      <section class="card">目前還沒有收到訊息。先把 LINE Official Account 的 webhook 接上，再傳一則文字來測試。</section>
+      <section class="card">目前還沒有收到訊息。先傳 LINE 訊息進來，或直接在上方貼文字與上傳附件測試。</section>
     {% endfor %}
   </main>
 </body>
