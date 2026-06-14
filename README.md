@@ -86,6 +86,7 @@ http://127.0.0.1:8000
 
 - `OPENAI_API_KEY`
 - `LINE_CHANNEL_SECRET`
+- `LINE_CHANNEL_ACCESS_TOKEN`
 - `SCHEDULE_DOCX_PATH`
 
 ## 部署
@@ -99,6 +100,20 @@ http://127.0.0.1:8000
 ```text
 https://你的服務網址/webhook/line
 ```
+
+目前也支援直接在 LINE 內操作：
+
+- 直接傳行程內容，系統會回一個代碼
+- `查看`
+- `查看 代碼`
+- `確認 代碼`
+- `略過 代碼`
+- `套用 代碼`
+
+如果你要讓 LINE 顯示的是我們自己的回覆，而不是官方預設那句「無法個別回覆」，還要確認：
+
+- Render 已設定 `LINE_CHANNEL_ACCESS_TOKEN`
+- LINE Official Account Manager 內把預設自動回應關掉或改掉
 
 健康檢查：
 
