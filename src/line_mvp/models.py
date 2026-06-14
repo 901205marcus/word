@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Optional
 
 
 class ActionType(str, Enum):
@@ -43,6 +42,7 @@ class InboxMessage:
     actions: list[ScheduleAction] = field(default_factory=list)
     error: str = ""
     output_path: str = ""
+    preview_paths: list[str] = field(default_factory=list)
 
 
 @dataclass(slots=True)
@@ -50,4 +50,5 @@ class ApplySummary:
     applied: list[str] = field(default_factory=list)
     skipped: list[str] = field(default_factory=list)
     messages: list[str] = field(default_factory=list)
-    output_path: Optional[str] = None
+    output_path: str | None = None
+    preview_paths: list[str] = field(default_factory=list)
