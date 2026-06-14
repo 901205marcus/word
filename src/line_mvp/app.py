@@ -69,8 +69,13 @@ async def line_webhook(request: Request):
     if not service.verify_signature(body, signature):
         raise HTTPException(status_code=401, detail="Invalid signature")
     payload = json.loads(body.decode("utf-8"))
-    created = service.ingest_webhook(payload)
-    return JSONResponse({"created": [message.id for message in created]})
+    result = service.ingest_webhook(payload)
+    return JSONResponse(
+        {
+            "created": [message.id for message in result["created"]],
+            "replies": result["replies"],
+        }
+    )
 
 
 @app.post("/review/{message_id}/refresh")
