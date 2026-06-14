@@ -1,0 +1,175 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="utf-8">
+  <title>LINE 行程收件匣 MVP</title>
+  <style>
+    :root {
+      --bg: #f4efe4;
+      --panel: #fffdf8;
+      --ink: #1f2b25;
+      --accent: #246a4b;
+      --line: #dbcdb7;
+      --warn: #8a5b19;
+    }
+    body {
+      margin: 0;
+      font-family: "Noto Sans TC", "Microsoft JhengHei", sans-serif;
+      background: linear-gradient(180deg, #ece4d5 0%, var(--bg) 50%, #f7f2e9 100%);
+      color: var(--ink);
+    }
+    main {
+      max-width: 1080px;
+      margin: 0 auto;
+      padding: 24px;
+    }
+    h1 {
+      margin: 0 0 8px;
+      font-size: 32px;
+    }
+    .hint {
+      margin-bottom: 20px;
+      color: #5c665f;
+    }
+    .card {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 18px;
+      padding: 18px;
+      margin-bottom: 18px;
+      box-shadow: 0 10px 30px rgba(60, 54, 42, 0.08);
+    }
+    .meta {
+      display: flex;
+      gap: 10px;
+      flex-wrap: wrap;
+      margin-bottom: 10px;
+      font-size: 13px;
+      color: #5c665f;
+    }
+    .pill {
+      border-radius: 999px;
+      padding: 4px 10px;
+      background: #edf5ef;
+      color: var(--accent);
+    }
+    pre {
+      white-space: pre-wrap;
+      background: #f8f4ec;
+      border-radius: 12px;
+      padding: 12px;
+      border: 1px solid #eadfcd;
+    }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      margin-top: 10px;
+    }
+    th, td {
+      border-bottom: 1px solid #eadfcd;
+      padding: 8px 6px;
+      text-align: left;
+      vertical-align: top;
+      font-size: 14px;
+    }
+    form {
+      margin-top: 12px;
+    }
+    input, button, select {
+      font: inherit;
+      padding: 8px 10px;
+      border-radius: 10px;
+      border: 1px solid #ccbca4;
+    }
+    input {
+      min-width: 420px;
+      max-width: 100%;
+    }
+    button {
+      background: var(--accent);
+      color: white;
+      cursor: pointer;
+    }
+    .secondary {
+      background: #f2eadb;
+      color: #38443c;
+    }
+    .error {
+      color: var(--warn);
+      margin-top: 10px;
+      white-space: pre-wrap;
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>LINE 行程收件匣 MVP</h1>
+    <div class="hint">流程：你把老闆訊息轉貼到 LINE Official Account，系統收進來後先解析，確認沒問題再套用到 Word。</div>
+    {% for message in messages %}
+      <section class="card">
+        <div class="meta">
+          <span class="pill">{{ message.status }}</span>
+          <span>{{ message.received_at }}</span>
+          <span>{{ message.source_type }}</span>
+          <span>{{ message.sender_id }}</span>
+        </div>
+        <pre>{{ message.raw_text }}</pre>
+        <table>
+          <thead>
+            <tr>
+              <th>動作</th>
+              <th>日期</th>
+              <th>時間</th>
+              <th>行程</th>
+              <th>地點</th>
+              <th>備註</th>
+              <th>信心</th>
+            </tr>
+          </thead>
+          <tbody>
+            {% for action in message.actions %}
+              <tr>
+                <td>{{ action.action }}</td>
+                <td>{{ action.date }}</td>
+                <td>{{ action.time }}</td>
+                <td>{{ action.event }}</td>
+                <td>{{ action.address }}</td>
+                <td>{{ action.note }}</td>
+                <td>{{ action.confidence }}</td>
+              </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+
+        <form action="/review/{{ message.id }}/refresh" method="post">
+          <button class="secondary" type="submit">重新解析</button>
+        </form>
+
+        <form action="/review/{{ message.id }}/status" method="post">
+          <select name="status">
+            <option value="pending">pending</option>
+            <option value="approved">approved</option>
+            <option value="skipped">skipped</option>
+            <option value="error">error</option>
+          </select>
+          <button class="secondary" type="submit">更新狀態</button>
+        </form>
+
+        <form action="/review/{{ message.id }}/apply" method="post">
+          <input name="docx_path" value="{{ default_docx_path }}" placeholder="請輸入要套用的 Word 絕對路徑">
+          <button type="submit">確認並輸出 Word</button>
+        </form>
+
+        {% if message.output_path %}
+          <div class="error">輸出檔案：{{ message.output_path }}</div>
+        {% endif %}
+        {% if message.error %}
+          <div class="error">{{ message.error }}</div>
+        {% endif %}
+      </section>
+    {% else %}
+      <section class="card">目前收件匣沒有資料。先把訊息轉貼到 LINE Official Account，webhook 進來後就會顯示在這裡。</section>
+    {% endfor %}
+  </main>
+</body>
+</html>
