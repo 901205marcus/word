@@ -87,6 +87,7 @@ http://127.0.0.1:8000
 - `OPENAI_API_KEY`
 - `LINE_CHANNEL_SECRET`
 - `LINE_CHANNEL_ACCESS_TOKEN`
+- `PUBLIC_BASE_URL`
 - `SCHEDULE_DOCX_PATH`
 
 ## 部署
@@ -113,7 +114,15 @@ https://你的服務網址/webhook/line
 如果你要讓 LINE 顯示的是我們自己的回覆，而不是官方預設那句「無法個別回覆」，還要確認：
 
 - Render 已設定 `LINE_CHANNEL_ACCESS_TOKEN`
+- Render 已設定 `PUBLIC_BASE_URL`
 - LINE Official Account Manager 內把預設自動回應關掉或改掉
+
+如果要在 LINE 內直接收到輸出結果，建議流程是：
+
+- 在 LINE 輸入 `套用 代碼`
+- 系統寫入 Word
+- 產生 JPG 預覽
+- LINE 主動推送 `Word 下載連結 + JPG 預覽圖`
 
 健康檢查：
 
