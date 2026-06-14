@@ -27,6 +27,7 @@ def health():
 def home(request: Request):
     messages = service.list_messages()
     return templates.TemplateResponse(
+        request,
         "line_review.html",
         {
             "request": request,
