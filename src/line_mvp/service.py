@@ -235,6 +235,7 @@ class LineMVPService:
                     f"寫入 Word 失敗：{exc}\n"
                     "請確認 Render 已設定 SCHEDULE_DOCX_PATH，且伺服器可以讀取該 .docx 檔案。"
                 )
+            self._push_apply_assets(sender_id, applied)
             return self._format_apply_reply(applied)
 
         return self._help_text()
@@ -243,15 +244,64 @@ class LineMVPService:
         token = os.getenv("LINE_CHANNEL_ACCESS_TOKEN", "").strip()
         if not token or not reply_token or not text:
             return False
-        payload = json.dumps(
+        req = self._make_line_request(
+            "https://api.line.me/v2/bot/message/reply",
+            token,
             {
                 "replyToken": reply_token,
                 "messages": [{"type": "text", "text": text[:5000]}],
             },
-            ensure_ascii=False,
-        ).encode("utf-8")
-        req = request.Request(
-            "https://api.line.me/v2/bot/message/reply",
+        )
+        try:
+            with request.urlopen(req, timeout=10) as response:
+                return 200 <= response.status < 300
+        except error.URLError:
+            return False
+
+    def _push_apply_assets(self, to: str, item: InboxMessage) -> bool:
+        token = os.getenv("LINE_CHANNEL_ACCESS_TOKEN", "").strip()
+        base_url = os.getenv("PUBLIC_BASE_URL", "").rstrip("/")
+        if not token or not to:
+            return False
+
+        messages: list[dict[str, str]] = []
+        text_lines = [
+            f"已完成寫入，案件代碼 {self._message_code(item)}。",
+            f"Word 檔：{Path(item.output_path).name if item.output_path else '未輸出'}",
+        ]
+        output_url = self._public_output_url(item.output_path, base_url)
+        if output_url:
+            text_lines.append(f"Word 下載：{output_url}")
+        messages.append({"type": "text", "text": "\n".join(text_lines)[:5000]})
+
+        preview_url = self._public_output_url(item.preview_paths[0], base_url) if item.preview_paths else ""
+        if preview_url:
+            messages.append(
+                {
+                    "type": "image",
+                    "originalContentUrl": preview_url,
+                    "previewImageUrl": preview_url,
+                }
+            )
+
+        req = self._make_line_request(
+            "https://api.line.me/v2/bot/message/push",
+            token,
+            {
+                "to": to,
+                "messages": messages,
+            },
+        )
+        try:
+            with request.urlopen(req, timeout=15) as response:
+                return 200 <= response.status < 300
+        except error.URLError:
+            return False
+
+    def _make_line_request(self, url: str, token: str, payload_obj: dict[str, Any]) -> request.Request:
+        payload = json.dumps(payload_obj, ensure_ascii=False).encode("utf-8")
+        return request.Request(
+            url,
             data=payload,
             headers={
                 "Content-Type": "application/json",
@@ -259,11 +309,16 @@ class LineMVPService:
             },
             method="POST",
         )
+
+    def _public_output_url(self, path: str, base_url: str) -> str:
+        if not path or not base_url:
+            return ""
+        candidate = Path(path)
         try:
-            with request.urlopen(req, timeout=10) as response:
-                return 200 <= response.status < 300
-        except error.URLError:
-            return False
+            relative = candidate.relative_to(self.output_dir)
+        except ValueError:
+            return ""
+        return f"{base_url}/files/{relative.as_posix()}"
 
     def _format_created_reply(self, item: InboxMessage) -> str:
         code = self._message_code(item)
