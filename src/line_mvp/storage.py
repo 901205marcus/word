@@ -25,6 +25,17 @@ class InboxStore:
                 return item
         return None
 
+    def find_message(self, sender_id: str, code: str | None = None) -> InboxMessage | None:
+        items = self.list_messages()
+        normalized = (code or "").strip().lower()
+        for item in items:
+            if item.sender_id != sender_id:
+                continue
+            if normalized and not item.id.lower().startswith(normalized):
+                continue
+            return item
+        return None
+
     def add_message(self, sender_id: str, source_type: str, raw_text: str) -> InboxMessage:
         item = InboxMessage(
             id=str(uuid4()),
