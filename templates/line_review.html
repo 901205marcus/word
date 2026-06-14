@@ -2,7 +2,7 @@
 <html lang="zh-Hant">
 <head>
   <meta charset="utf-8">
-  <title>LINE 行程收件匣 MVP</title>
+  <title>LINE 行程審核 MVP</title>
   <style>
     :root {
       --bg: #f4efe4;
@@ -103,8 +103,8 @@
 </head>
 <body>
   <main>
-    <h1>LINE 行程收件匣 MVP</h1>
-    <div class="hint">流程：你把老闆訊息轉貼到 LINE Official Account，系統收進來後先解析，確認沒問題再套用到 Word。</div>
+    <h1>LINE 行程審核 MVP</h1>
+    <div class="hint">這裡會列出從 LINE Official Account webhook 收到的訊息，先人工確認，再決定是否寫入 Word。</div>
     {% for message in messages %}
       <section class="card">
         <div class="meta">
@@ -121,9 +121,9 @@
               <th>日期</th>
               <th>時間</th>
               <th>行程</th>
-              <th>地點</th>
+              <th>地址</th>
               <th>備註</th>
-              <th>信心</th>
+              <th>信心值</th>
             </tr>
           </thead>
           <tbody>
@@ -148,6 +148,7 @@
         <form action="/review/{{ message.id }}/status" method="post">
           <select name="status">
             <option value="pending">pending</option>
+            <option value="applied">applied</option>
             <option value="approved">approved</option>
             <option value="skipped">skipped</option>
             <option value="error">error</option>
@@ -156,8 +157,8 @@
         </form>
 
         <form action="/review/{{ message.id }}/apply" method="post">
-          <input name="docx_path" value="{{ default_docx_path }}" placeholder="請輸入要套用的 Word 絕對路徑">
-          <button type="submit">確認並輸出 Word</button>
+          <input name="docx_path" value="{{ default_docx_path }}" placeholder="請輸入可讀取的 Word 檔路徑">
+          <button type="submit">套用到 Word</button>
         </form>
 
         {% if message.output_path %}
@@ -168,7 +169,7 @@
         {% endif %}
       </section>
     {% else %}
-      <section class="card">目前收件匣沒有資料。先把訊息轉貼到 LINE Official Account，webhook 進來後就會顯示在這裡。</section>
+      <section class="card">目前還沒有收到訊息。先把 LINE Official Account 的 webhook 接上，再傳一則文字來測試。</section>
     {% endfor %}
   </main>
 </body>
