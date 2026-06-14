@@ -6,7 +6,7 @@ from datetime import datetime
 from pathlib import Path
 from uuid import uuid4
 
-from .models import InboxMessage, MessageStatus, ScheduleAction
+from .models import ActionType, InboxMessage, MessageStatus, ScheduleAction
 
 
 class InboxStore:
@@ -52,6 +52,11 @@ class InboxStore:
         for item in items:
             raw = asdict(item)
             raw["status"] = item.status.value
+            raw["actions"] = []
+            for action in item.actions:
+                action_raw = asdict(action)
+                action_raw["action"] = action.action.value
+                raw["actions"].append(action_raw)
             payload.append(raw)
         self.path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
@@ -64,7 +69,21 @@ class InboxStore:
             source_type=item["source_type"],
             raw_text=item["raw_text"],
             status=MessageStatus(item.get("status", "pending")),
-            actions=[ScheduleAction(**action) for action in item.get("actions", [])],
+            actions=[
+                ScheduleAction(
+                    action=ActionType(action["action"]),
+                    date=action.get("date", ""),
+                    time=action.get("time", ""),
+                    event=action.get("event", ""),
+                    address=action.get("address", ""),
+                    note=action.get("note", ""),
+                    source_text=action.get("source_text", ""),
+                    confidence=float(action.get("confidence", 0.5)),
+                    requires_review=bool(action.get("requires_review", True)),
+                )
+                for action in item.get("actions", [])
+            ],
             error=item.get("error", ""),
             output_path=item.get("output_path", ""),
+            preview_paths=list(item.get("preview_paths", [])),
         )
