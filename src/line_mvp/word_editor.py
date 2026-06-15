@@ -83,7 +83,7 @@ class ScheduleWordEditor:
                 messages.append(corrected)
 
         for month in sorted(relevant_months):
-            inserted = self.complete_month(month, mode="range", action_dates=actions or [])
+            inserted = self.complete_month(month, mode="full", action_dates=actions or [])
             if inserted:
                 messages.append(f"已補齊 {month} 月日期：{', '.join(inserted)}")
 
