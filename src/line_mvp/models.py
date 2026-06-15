@@ -43,6 +43,8 @@ class InboxMessage:
     error: str = ""
     output_path: str = ""
     preview_paths: list[str] = field(default_factory=list)
+    template_docx_path: str = ""
+    uploaded_files: list[str] = field(default_factory=list)
 
 
 @dataclass(slots=True)
