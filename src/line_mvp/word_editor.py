@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import re
+from calendar import monthrange
 from copy import deepcopy
+from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from pathlib import Path
 
@@ -15,6 +17,18 @@ HEADER_WITH_WEEKDAY_PATTERN = re.compile(
     r"(?P<date>\d{1,2}/\d{1,2})(?P<space>\s*)(?P<open>[\(（])(?P<weekday>[一二三四五六日天])(?P<close>[\)）])"
 )
 WEEKDAY_MAP = "一二三四五六日"
+
+
+@dataclass(slots=True)
+class DayHeader:
+    row_idx: int
+    month: int
+    day: int
+    raw_text: str
+
+    @property
+    def date_text(self) -> str:
+        return f"{self.month}/{self.day}"
 
 
 def cell_text(cell) -> str:
@@ -58,6 +72,27 @@ class ScheduleWordEditor:
         output = str(output_path)
         self.doc.save(output)
         return output
+
+    def autofix_template(self, actions: list[ScheduleAction] | None = None) -> list[str]:
+        messages: list[str] = []
+        relevant_months = self._collect_relevant_months(actions or [])
+
+        for header in self.list_day_headers():
+            corrected = self._correct_header_weekday(header.row_idx)
+            if corrected:
+                messages.append(corrected)
+
+        for month in sorted(relevant_months):
+            inserted = self.complete_month(month, mode="range", action_dates=actions or [])
+            if inserted:
+                messages.append(f"已補齊 {month} 月日期：{', '.join(inserted)}")
+
+        for header in self.list_day_headers():
+            corrected = self._correct_header_weekday(header.row_idx)
+            if corrected:
+                messages.append(corrected)
+
+        return self._dedupe_messages(messages)
 
     def find_day_row(self, date_text: str) -> int | None:
         target = normalize_date(date_text)
@@ -111,43 +146,17 @@ class ScheduleWordEditor:
         if existing is not None:
             return existing
 
-        day_rows = self._day_rows()
-        if not day_rows:
+        target_date = self._date_in_document_year(normalized_target)
+        previous_header, next_header = self._find_neighbor_headers(target_date)
+        if previous_header is None and next_header is None:
             raise ValueError("Word 表格裡找不到任何日期標題列，無法自動補日期。")
 
-        blocks = [
-            {
-                "row": row_idx,
-                "date_text": self._extract_header_date(row_idx),
-                "date_obj": self._as_date(self._extract_header_date(row_idx)),
-            }
-            for row_idx in day_rows
-        ]
-        blocks = [block for block in blocks if block["date_text"]]
-        if not blocks:
-            raise ValueError("Word 表格裡找不到可辨識的日期標題列，無法自動補日期。")
-
-        target_date = self._as_date(normalized_target)
-
-        previous_block = None
-        next_block = None
-        for block in blocks:
-            block_date = block["date_obj"]
-            if block_date < target_date:
-                previous_block = block
-                continue
-            if block_date > target_date:
-                next_block = block
-                break
-
-        if previous_block and next_block:
-            self._fill_gap_after_block(previous_block["row"], target_date, stop_before=next_block["row"])
-        elif previous_block:
-            self._fill_gap_after_block(previous_block["row"], target_date)
-        elif next_block:
-            self._fill_gap_before_block(next_block["row"], target_date)
-        else:
-            raise ValueError("找不到可複製的日期模板。")
+        if previous_header and next_header:
+            self._fill_gap_after_header(previous_header, target_date, stop_before=next_header.row_idx)
+        elif previous_header:
+            self._fill_gap_after_header(previous_header, target_date)
+        elif next_header:
+            self._fill_gap_before_header(next_header, target_date)
 
         created = self.find_day_row(normalized_target)
         if created is None:
@@ -175,6 +184,8 @@ class ScheduleWordEditor:
 
     def apply(self, actions: list[ScheduleAction], output_dir: str | Path) -> ApplySummary:
         summary = ApplySummary()
+        summary.messages.extend(self.autofix_template(actions))
+
         for action in actions:
             try:
                 if action.action == ActionType.ADD:
@@ -199,69 +210,80 @@ class ScheduleWordEditor:
         summary.output_path = self.save_as(output_path)
         return summary
 
-    def _fill_gap_after_block(self, start_row: int, target_date: date, stop_before: int | None = None) -> None:
-        current_text = self._extract_header_date(start_row)
-        current_date = self._as_date(current_text)
-        anchor_row = self.find_next_day_row(start_row) if stop_before is None else stop_before
-        template_row = start_row
+    def list_day_headers(self) -> list[DayHeader]:
+        headers: list[DayHeader] = []
+        for row_idx in range(len(self.table.rows)):
+            texts = row_texts(self.table, row_idx)
+            for text in texts:
+                match = DAY_HEADER_PATTERN.search(text)
+                if match:
+                    headers.append(
+                        DayHeader(
+                            row_idx=row_idx,
+                            month=int(match.group(1)),
+                            day=int(match.group(2)),
+                            raw_text=text,
+                        )
+                    )
+                    break
+        return headers
 
-        next_date = current_date + timedelta(days=1)
-        while next_date <= target_date:
-            inserted = self._clone_day_block(template_row, anchor_row, self._format_date(next_date))
-            template_row = inserted
-            anchor_row = self.find_next_day_row(inserted)
-            next_date += timedelta(days=1)
+    def complete_month(
+        self,
+        month: int,
+        *,
+        mode: str = "range",
+        action_dates: list[ScheduleAction] | None = None,
+    ) -> list[str]:
+        headers = [header for header in self.list_day_headers() if header.month == month]
+        action_days = [
+            int(normalize_date(action.date).split("/")[1])
+            for action in (action_dates or [])
+            if normalize_date(action.date).startswith(f"{month}/")
+        ]
+        if not headers and not action_days:
+            return []
 
-    def _fill_gap_before_block(self, next_row: int, target_date: date) -> None:
-        next_text = self._extract_header_date(next_row)
-        next_date = self._as_date(next_text)
-        missing_dates: list[date] = []
+        last_day = monthrange(self.document_year, month)[1]
+        existing_days = {header.day for header in headers}
 
-        cursor = target_date
-        while cursor < next_date:
-            missing_dates.append(cursor)
-            cursor += timedelta(days=1)
-
-        if not missing_dates:
-            return
-
-        template_row = next_row
-        anchor_row = next_row
-        for missing_date in reversed(missing_dates):
-            inserted = self._clone_day_block(template_row, anchor_row, self._format_date(missing_date))
-            template_row = inserted
-            anchor_row = inserted
-
-    def _clone_day_block(self, template_day_row: int, insert_before: int, date_text: str) -> int:
-        block_size = self.find_next_day_row(template_day_row) - template_day_row
-        if block_size <= 0:
-            raise ValueError("日期區塊格式異常，無法複製日期模板。")
-
-        template_rows = [deepcopy(self.table.rows[template_day_row + offset]._tr) for offset in range(block_size)]
-        inserted_rows: list[int] = []
-
-        if insert_before >= len(self.table.rows):
-            for new_tr in template_rows:
-                self.table._tbl.append(new_tr)
-                inserted_rows.append(self._locate_row(new_tr))
+        if mode == "full":
+            start_day = 1
+            end_day = last_day
         else:
-            anchor = self.table.rows[insert_before]._tr
-            previous = anchor
-            for index, new_tr in enumerate(template_rows):
-                if index == 0:
-                    previous.addprevious(new_tr)
-                else:
-                    previous.addnext(new_tr)
-                previous = new_tr
-                inserted_rows.append(self._locate_row(new_tr))
+            candidates = list(existing_days) + action_days
+            start_day = min(candidates)
+            end_day = max(candidates)
 
-        header_row_idx = inserted_rows[0]
-        self._set_day_header_text(header_row_idx, normalize_date(date_text))
-        for row_idx in inserted_rows[1:]:
-            row = self.table.rows[row_idx]
-            for cell_index in range(1, min(5, len(row.cells))):
-                set_cell_text(row.cells[cell_index], "")
-        return header_row_idx
+        inserted_dates: list[str] = []
+        for day_value in range(start_day, end_day + 1):
+            if day_value in existing_days:
+                continue
+            self.insert_clean_day_block(month, day_value)
+            inserted_dates.append(f"{month}/{day_value}")
+            existing_days.add(day_value)
+        return inserted_dates
+
+    def insert_clean_day_block(self, month: int, day_value: int) -> int:
+        date_text = f"{month}/{day_value}"
+        existing = self.find_day_row(date_text)
+        if existing is not None:
+            return existing
+
+        target_date = date(self.document_year, month, day_value)
+        previous_header, next_header = self._find_neighbor_headers(target_date)
+
+        if previous_header:
+            self._fill_gap_after_header(previous_header, target_date, stop_before=next_header.row_idx if next_header else None)
+        elif next_header:
+            self._fill_gap_before_header(next_header, target_date)
+        else:
+            raise ValueError("找不到可複製的日期模板。")
+
+        row = self.find_day_row(date_text)
+        if row is None:
+            raise ValueError(f"插入日期 {date_text} 失敗。")
+        return row
 
     def _read_day_entries(self, day_row: int) -> list[dict[str, str]]:
         entries: list[dict[str, str]] = []
@@ -317,6 +339,68 @@ class ScheduleWordEditor:
         if len(row.cells) > 4:
             set_cell_text(row.cells[4], entry["note"])
 
+    def _fill_gap_after_header(
+        self,
+        header: DayHeader,
+        target_date: date,
+        *,
+        stop_before: int | None = None,
+    ) -> None:
+        anchor_row = self.find_next_day_row(header.row_idx) if stop_before is None else stop_before
+        template_row = header.row_idx
+        cursor = self._header_date(header) + timedelta(days=1)
+        while cursor <= target_date:
+            inserted_row = self._clone_day_block(template_row, anchor_row, cursor)
+            template_row = inserted_row
+            anchor_row = self.find_next_day_row(inserted_row)
+            cursor += timedelta(days=1)
+
+    def _fill_gap_before_header(self, header: DayHeader, target_date: date) -> None:
+        missing_dates: list[date] = []
+        cursor = target_date
+        end_date = self._header_date(header)
+        while cursor < end_date:
+            missing_dates.append(cursor)
+            cursor += timedelta(days=1)
+
+        template_row = header.row_idx
+        anchor_row = header.row_idx
+        for missing_date in reversed(missing_dates):
+            inserted_row = self._clone_day_block(template_row, anchor_row, missing_date)
+            template_row = inserted_row
+            anchor_row = inserted_row
+
+    def _clone_day_block(self, template_day_row: int, insert_before: int, target_date: date) -> int:
+        block_size = self.find_next_day_row(template_day_row) - template_day_row
+        if block_size <= 0:
+            raise ValueError("日期區塊格式異常，無法複製日期模板。")
+
+        template_rows = [deepcopy(self.table.rows[template_day_row + offset]._tr) for offset in range(block_size)]
+        inserted_rows: list[int] = []
+
+        if insert_before >= len(self.table.rows):
+            for new_tr in template_rows:
+                self.table._tbl.append(new_tr)
+                inserted_rows.append(self._locate_row(new_tr))
+        else:
+            anchor = self.table.rows[insert_before]._tr
+            previous = anchor
+            for index, new_tr in enumerate(template_rows):
+                if index == 0:
+                    previous.addprevious(new_tr)
+                else:
+                    previous.addnext(new_tr)
+                previous = new_tr
+                inserted_rows.append(self._locate_row(new_tr))
+
+        header_row_idx = inserted_rows[0]
+        self._set_day_header_text(header_row_idx, self._format_date(target_date))
+        for row_idx in inserted_rows[1:]:
+            row = self.table.rows[row_idx]
+            for cell_index in range(1, min(5, len(row.cells))):
+                set_cell_text(row.cells[cell_index], "")
+        return header_row_idx
+
     def _insert_row_before(self, row_idx: int, template_row_idx: int) -> int:
         new_tr = deepcopy(self.table.rows[template_row_idx]._tr)
         if row_idx >= len(self.table.rows):
@@ -325,20 +409,21 @@ class ScheduleWordEditor:
             self.table.rows[row_idx]._tr.addprevious(new_tr)
         return self._locate_row(new_tr)
 
-    def _day_rows(self) -> list[int]:
-        rows: list[int] = []
-        for idx in range(len(self.table.rows)):
-            merged = " | ".join(row_texts(self.table, idx))
-            if DAY_HEADER_PATTERN.search(merged):
-                rows.append(idx)
-        return rows
+    def _find_neighbor_headers(self, target_date: date) -> tuple[DayHeader | None, DayHeader | None]:
+        previous_header: DayHeader | None = None
+        next_header: DayHeader | None = None
+        for header in self.list_day_headers():
+            header_date = self._header_date(header)
+            if header_date < target_date:
+                previous_header = header
+                continue
+            if header_date > target_date:
+                next_header = header
+                break
+        return previous_header, next_header
 
-    def _extract_header_date(self, row_idx: int) -> str:
-        for text in row_texts(self.table, row_idx):
-            match = DAY_HEADER_PATTERN.search(text)
-            if match:
-                return f"{int(match.group(1))}/{int(match.group(2))}"
-        return ""
+    def _header_date(self, header: DayHeader) -> date:
+        return date(self.document_year, header.month, header.day)
 
     def _set_day_header_text(self, row_idx: int, date_text: str) -> None:
         row = self.table.rows[row_idx]
@@ -367,33 +452,56 @@ class ScheduleWordEditor:
         target_index = 1 if len(row.cells) > 1 else 0
         set_cell_text(row.cells[target_index], header_text)
 
+    def _correct_header_weekday(self, row_idx: int) -> str:
+        row = self.table.rows[row_idx]
+        normalized = self._extract_header_date(row_idx)
+        if not normalized:
+            return ""
+
+        expected_weekday = self._weekday_text(normalized)
+        for cell in row.cells:
+            original = cell_text(cell)
+            match = HEADER_WITH_WEEKDAY_PATTERN.search(original)
+            if not match:
+                continue
+            if match.group("weekday") == expected_weekday:
+                return ""
+            updated = HEADER_WITH_WEEKDAY_PATTERN.sub(
+                lambda current: (
+                    f"{normalize_date(normalized)}"
+                    f"{current.group('space')}"
+                    f"{current.group('open')}"
+                    f"{expected_weekday}"
+                    f"{current.group('close')}"
+                ),
+                original,
+                count=1,
+            )
+            set_cell_text(cell, updated)
+            return f"已校正星期：{normalize_date(normalized)} -> {expected_weekday}"
+        return ""
+
+    def _extract_header_date(self, row_idx: int) -> str:
+        for text in row_texts(self.table, row_idx):
+            match = DAY_HEADER_PATTERN.search(text)
+            if match:
+                return f"{int(match.group(1))}/{int(match.group(2))}"
+        return ""
+
     def _locate_row(self, target_tr) -> int:
         for idx in range(len(self.table.rows)):
             if self.table.rows[idx]._tr is target_tr:
                 return idx
         raise RuntimeError("找不到剛插入的列。")
 
-    @staticmethod
-    def _date_sort_key(value: str) -> tuple[int, int]:
-        normalized = normalize_date(value)
-        match = re.fullmatch(r"(\d{1,2})/(\d{1,2})", normalized)
-        if not match:
-            return (99, 99)
-        return int(match.group(1)), int(match.group(2))
-
-    @staticmethod
-    def _as_date(value: str) -> date:
-        normalized = normalize_date(value)
-        match = re.fullmatch(r"(\d{1,2})/(\d{1,2})", normalized)
-        if not match:
-            raise ValueError(f"無法辨識日期格式：{value}")
-        month = int(match.group(1))
-        day = int(match.group(2))
-        return date(2000, month, day)
-
-    @staticmethod
-    def _format_date(value: date) -> str:
-        return f"{value.month}/{value.day}"
+    def _collect_relevant_months(self, actions: list[ScheduleAction]) -> set[int]:
+        months = {header.month for header in self.list_day_headers()}
+        for action in actions:
+            normalized = normalize_date(action.date)
+            match = re.fullmatch(r"(\d{1,2})/(\d{1,2})", normalized)
+            if match:
+                months.add(int(match.group(1)))
+        return months
 
     def _detect_document_year(self) -> int:
         texts = [paragraph.text for paragraph in self.doc.paragraphs]
@@ -402,7 +510,6 @@ class ScheduleWordEditor:
                 texts.append(cell_text(cell))
 
         merged = "\n".join(texts)
-
         ad_match = re.search(r"(20\d{2})年", merged)
         if ad_match:
             return int(ad_match.group(1))
@@ -417,12 +524,31 @@ class ScheduleWordEditor:
 
         return datetime.now().year
 
+    def _date_in_document_year(self, date_text: str) -> date:
+        normalized = normalize_date(date_text)
+        match = re.fullmatch(r"(\d{1,2})/(\d{1,2})", normalized)
+        if not match:
+            raise ValueError(f"無法辨識日期格式：{date_text}")
+        return date(self.document_year, int(match.group(1)), int(match.group(2)))
+
     def _build_header_text(self, normalized_date: str) -> str:
         return f"{normalized_date} ({self._weekday_text(normalized_date)})"
 
     def _weekday_text(self, normalized_date: str) -> str:
-        match = re.fullmatch(r"(\d{1,2})/(\d{1,2})", normalize_date(normalized_date))
-        if not match:
-            return ""
-        target = date(self.document_year, int(match.group(1)), int(match.group(2)))
+        target = self._date_in_document_year(normalized_date)
         return WEEKDAY_MAP[target.weekday()]
+
+    @staticmethod
+    def _format_date(value: date) -> str:
+        return f"{value.month}/{value.day}"
+
+    @staticmethod
+    def _dedupe_messages(messages: list[str]) -> list[str]:
+        seen: set[str] = set()
+        result: list[str] = []
+        for message in messages:
+            if not message or message in seen:
+                continue
+            seen.add(message)
+            result.append(message)
+        return result
