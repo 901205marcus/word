@@ -10,7 +10,11 @@ from docx import Document
 from .models import ActionType, ApplySummary, ScheduleAction
 from .parser import normalize_date, normalize_time, time_sort_key
 
-DAY_HEADER_PATTERN = re.compile(r"(\d{1,2})/(\d{1,2})(?:[\(（]|$)")
+DAY_HEADER_PATTERN = re.compile(r"(\d{1,2})/(\d{1,2})(?:\s*[\(（]|$)")
+HEADER_WITH_WEEKDAY_PATTERN = re.compile(
+    r"(?P<date>\d{1,2}/\d{1,2})(?P<space>\s*)(?P<open>[\(（])(?P<weekday>[一二三四五六日天])(?P<close>[\)）])"
+)
+WEEKDAY_MAP = "一二三四五六日"
 
 
 def cell_text(cell) -> str:
@@ -48,6 +52,7 @@ class ScheduleWordEditor:
         if not self.doc.tables:
             raise ValueError("Word 檔沒有表格，這版目前無法處理。")
         self.table = self.doc.tables[0]
+        self.document_year = self._detect_document_year()
 
     def save_as(self, output_path: str | Path) -> str:
         output = str(output_path)
@@ -338,14 +343,29 @@ class ScheduleWordEditor:
     def _set_day_header_text(self, row_idx: int, date_text: str) -> None:
         row = self.table.rows[row_idx]
         normalized = normalize_date(date_text)
+        header_text = self._build_header_text(normalized)
         for cell in row.cells:
             original = cell_text(cell)
             if DAY_HEADER_PATTERN.search(original):
-                updated = re.sub(r"\d{1,2}/\d{1,2}", normalized, original, count=1)
+                weekday_match = HEADER_WITH_WEEKDAY_PATTERN.search(original)
+                if weekday_match:
+                    updated = HEADER_WITH_WEEKDAY_PATTERN.sub(
+                        lambda match: (
+                            f"{normalized}"
+                            f"{match.group('space')}"
+                            f"{match.group('open')}"
+                            f"{self._weekday_text(normalized)}"
+                            f"{match.group('close')}"
+                        ),
+                        original,
+                        count=1,
+                    )
+                else:
+                    updated = re.sub(r"\d{1,2}/\d{1,2}", normalized, original, count=1)
                 set_cell_text(cell, updated)
                 return
         target_index = 1 if len(row.cells) > 1 else 0
-        set_cell_text(row.cells[target_index], f"{normalized}( )")
+        set_cell_text(row.cells[target_index], header_text)
 
     def _locate_row(self, target_tr) -> int:
         for idx in range(len(self.table.rows)):
@@ -374,3 +394,35 @@ class ScheduleWordEditor:
     @staticmethod
     def _format_date(value: date) -> str:
         return f"{value.month}/{value.day}"
+
+    def _detect_document_year(self) -> int:
+        texts = [paragraph.text for paragraph in self.doc.paragraphs]
+        for row in self.table.rows:
+            for cell in row.cells:
+                texts.append(cell_text(cell))
+
+        merged = "\n".join(texts)
+
+        ad_match = re.search(r"(20\d{2})年", merged)
+        if ad_match:
+            return int(ad_match.group(1))
+
+        roc_match = re.search(r"(?<!\d)(1\d{2})年", merged)
+        if roc_match:
+            return int(roc_match.group(1)) + 1911
+
+        stem_match = re.match(r"^(1\d{2})\d{4}", self.path.stem)
+        if stem_match:
+            return int(stem_match.group(1)) + 1911
+
+        return datetime.now().year
+
+    def _build_header_text(self, normalized_date: str) -> str:
+        return f"{normalized_date} ({self._weekday_text(normalized_date)})"
+
+    def _weekday_text(self, normalized_date: str) -> str:
+        match = re.fullmatch(r"(\d{1,2})/(\d{1,2})", normalize_date(normalized_date))
+        if not match:
+            return ""
+        target = date(self.document_year, int(match.group(1)), int(match.group(2)))
+        return WEEKDAY_MAP[target.weekday()]
