@@ -285,15 +285,21 @@ class LineMVPService:
                 else "目前還沒有 Word 模板，之後可先上傳 .docx 再套用。"
             )
             return (
-                f"已確認行程，代碼 {self._message_code(item)}。\n"
+                "系統狀態更新：已完成人工確認。\n"
+                f"案件代碼：{self._message_code(item)}\n"
                 f"{template_hint}\n"
-                f"若要正式寫入 Word，請回覆「套用 {self._message_code(item)}」。"
+                f"目前累積行程：{len(item.actions)} 筆\n"
+                f"下一步：如要正式寫入 Word，請回覆「套用 {self._message_code(item)}」。"
             )
 
         if command == "skip":
             item.status = MessageStatus.SKIPPED
             self.store.update_message(item)
-            return f"這筆行程已先略過，代碼 {self._message_code(item)}。"
+            return (
+                "系統狀態更新：本次草稿已標記為略過。\n"
+                f"案件代碼：{self._message_code(item)}\n"
+                "如要重新整理，可再重新傳送新的行程內容。"
+            )
 
         if command == "apply":
             try:
@@ -442,38 +448,59 @@ class LineMVPService:
     def _format_created_reply(self, item: InboxMessage) -> str:
         code = self._message_code(item)
         template_name = Path(item.template_docx_path).name if item.template_docx_path else "尚未上傳"
+        template_status = (
+            f"已收到 Word 模板：{template_name}"
+            if item.template_docx_path
+            else "尚未收到 Word 模板"
+        )
         if not item.actions:
             return (
-                f"已收到訊息，案件代碼 {code}。\n"
-                f"目前 Word 模板：{template_name}\n"
-                "目前尚未成功辨識出可用行程。\n"
-                f"你可以繼續傳行程、圖片、附件，或上傳 .docx 模板。\n"
-                f"請回覆「查看 {code}」檢查內容。"
+                "系統通知：已收到新內容並建立本次草稿。\n"
+                f"案件代碼：{code}\n"
+                f"{template_status}\n"
+                "行程辨識結果：目前尚未成功拆出可用行程。\n"
+                "建議操作：\n"
+                "1. 繼續補傳行程文字、圖片或附件\n"
+                "2. 上傳本次要修改的 .docx 模板\n"
+                f"3. 回覆「查看 {code}」檢查目前草稿"
             )
         first = item.actions[0]
         return (
-            f"已收到並完成初步整理，案件代碼 {code}。\n"
-            f"目前 Word 模板：{template_name}\n"
-            f"本次共解析 {len(item.actions)} 筆行程。\n"
-            f"首筆內容：{first.date} {first.time or '時間待補'} {first.event or '行程待補'}\n"
-            f"可直接回覆：查看 {code}、確認 {code}、略過 {code}、套用 {code}"
+            "系統通知：已收到內容並完成初步整理。\n"
+            f"案件代碼：{code}\n"
+            f"{template_status}\n"
+            f"目前共解析：{len(item.actions)} 筆行程\n"
+            f"首筆摘要：{first.date} {first.time or '時間待補'} {first.event or '行程待補'}\n"
+            "建議下一步：\n"
+            f"- 查看明細：查看 {code}\n"
+            f"- 人工確認：確認 {code}\n"
+            f"- 暫不處理：略過 {code}\n"
+            f"- 直接套用：套用 {code}"
         )
 
     def _format_template_reply(self, item: InboxMessage, filename: str) -> str:
         code = self._message_code(item)
         action_count = len(item.actions)
         return (
-            f"已收到 Word 模板 {filename}，案件代碼 {code}。\n"
-            f"目前已累積 {action_count} 筆行程。\n"
-            f"你可以繼續傳本次要寫入的 LINE 內容，整理好後回覆「確認 {code}」。"
+            "系統通知：已收到本次 Word 模板。\n"
+            f"案件代碼：{code}\n"
+            f"模板檔名：{filename}\n"
+            f"目前已累積：{action_count} 筆行程\n"
+            "建議下一步：\n"
+            "- 如果還有行程內容，請繼續傳送\n"
+            f"- 若本次內容已齊全，請回覆「確認 {code}」"
         )
 
     def _format_attachment_reply(self, item: InboxMessage, filename: str) -> str:
         code = self._message_code(item)
         return (
-            f"已收到附件 {filename}，並加入本次整理，案件代碼 {code}。\n"
-            f"目前共整理 {len(item.actions)} 筆行程。\n"
-            f"你可以繼續補充內容，或回覆「查看 {code}」。"
+            "系統通知：附件已成功併入本次草稿。\n"
+            f"案件代碼：{code}\n"
+            f"附件名稱：{filename}\n"
+            f"目前共整理：{len(item.actions)} 筆行程\n"
+            "建議下一步：\n"
+            "- 繼續補充內容\n"
+            f"- 或回覆「查看 {code}」檢查目前整理結果"
         )
 
     def _format_item_summary(self, item: InboxMessage) -> str:
@@ -503,6 +530,10 @@ class LineMVPService:
             lines.append(f"系統備註：{item.error[:120]}")
         if item.uploaded_files:
             lines.append(f"附件數量：{len(item.uploaded_files)}")
+        lines.append("可用操作：")
+        lines.append(f"1. 確認 {code}")
+        lines.append(f"2. 略過 {code}")
+        lines.append(f"3. 套用 {code}")
         return "\n".join(lines)
 
     def _format_apply_reply(self, item: InboxMessage) -> str:
@@ -510,10 +541,12 @@ class LineMVPService:
         path = Path(item.output_path).name if item.output_path else "未輸出"
         preview = Path(item.preview_paths[0]).name if item.preview_paths else "未產生"
         return (
-            f"已完成寫入，案件代碼 {code}。\n"
+            "系統通知：已完成 Word 寫入與預覽輸出。\n"
+            f"案件代碼：{code}\n"
             f"Word 檔：{path}\n"
             f"預覽圖：{preview}\n"
-            "建議再回到管理頁確認版面與排序是否正確。"
+            "系統接著會嘗試把 Word 下載連結與 JPG 預覽推送回 LINE。\n"
+            "建議你再確認版面、排序與地圖指引是否正確。"
         )
 
     def _message_code(self, item: InboxMessage) -> str:
@@ -521,10 +554,10 @@ class LineMVPService:
 
     def _help_text(self) -> str:
         return (
-            "可用指令如下：\n"
-            "查看 或 查看 代碼\n"
-            "確認 或 確認 代碼\n"
-            "略過 或 略過 代碼\n"
-            "套用 或 套用 代碼\n"
-            "你也可以直接傳送行程內容，或上傳 .docx 模板，系統會先整理後回覆案件代碼。"
+            "系統說明：目前可用指令如下。\n"
+            "1. 查看 或 查看 代碼\n"
+            "2. 確認 或 確認 代碼\n"
+            "3. 略過 或 略過 代碼\n"
+            "4. 套用 或 套用 代碼\n"
+            "你也可以直接傳送行程內容，或上傳 .docx 模板，系統會先整理成同一筆草稿後再回覆案件代碼。"
         )
