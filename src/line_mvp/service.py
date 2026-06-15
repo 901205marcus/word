@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hmac
 import json
+import mimetypes
 import os
 from base64 import b64encode
 from dataclasses import asdict, replace
@@ -46,19 +47,18 @@ class LineMVPService:
             if event.get("type") != "message":
                 continue
             message = event.get("message", {})
-            if message.get("type") != "text":
-                continue
             source = event.get("source", {})
-            raw_text = message.get("text", "").strip()
-            if not raw_text:
-                continue
             sender_id = source.get("userId") or source.get("groupId") or "unknown"
-            reply_text = self._handle_line_text(sender_id, source.get("type", "unknown"), raw_text)
+            message_type = message.get("type", "")
+            raw_text = message.get("text", "").strip() if message_type == "text" else ""
+            reply_text = self._handle_line_event(sender_id, source.get("type", "unknown"), message)
+            if not reply_text:
+                continue
             reply_token = event.get("replyToken", "")
             if reply_token and reply_text:
                 success = self._reply_line_message(reply_token, reply_text)
                 replies.append({"sender_id": sender_id, "ok": "true" if success else "false"})
-            latest = self.store.find_message(sender_id)
+            latest = self.store.find_active_draft(sender_id) or self.store.find_message(sender_id)
             if latest and latest.raw_text == raw_text:
                 created.append(latest)
         return {"created": created, "replies": replies}
@@ -108,7 +108,12 @@ class LineMVPService:
         uploaded_content: bytes | None = None,
     ) -> InboxMessage:
         item = self._require(message_id)
-        resolved_path = self._resolve_docx_path(docx_path, uploaded_filename, uploaded_content)
+        resolved_path = self._resolve_docx_path(
+            docx_path,
+            uploaded_filename,
+            uploaded_content,
+            fallback_item=item,
+        )
         editor = ScheduleWordEditor(resolved_path)
         actions = self._enrich_actions(item.actions)
         summary = editor.apply(actions, self.output_dir)
@@ -124,25 +129,82 @@ class LineMVPService:
     def list_messages(self) -> list[InboxMessage]:
         return self.store.list_messages()
 
+    def _handle_line_event(self, sender_id: str, source_type: str, message: dict[str, Any]) -> str:
+        message_type = message.get("type", "")
+        if message_type == "text":
+            raw_text = message.get("text", "").strip()
+            if not raw_text:
+                return ""
+            return self._handle_line_text(sender_id, source_type, raw_text)
+
+        if message_type in {"file", "image"}:
+            return self._handle_line_attachment(sender_id, source_type, message)
+
+        return "目前這種 LINE 訊息格式尚未支援，請傳文字、圖片，或 .docx 檔。"
+
     def _handle_line_text(self, sender_id: str, source_type: str, raw_text: str) -> str:
         command, code = self._parse_line_command(raw_text)
         if command:
             return self._execute_line_command(sender_id, command, code)
 
-        item = self.store.add_message(
-            sender_id=sender_id,
-            source_type=source_type,
-            raw_text=raw_text,
-        )
-        item.actions = self._enrich_actions(self.parser.parse(raw_text))
+        item = self.store.find_active_draft(sender_id)
+        if item is None:
+            item = self.store.add_message(
+                sender_id=sender_id,
+                source_type=source_type,
+                raw_text=raw_text,
+            )
+        else:
+            item.raw_text = self._merge_text(item.raw_text, raw_text)
+        item.actions = self._enrich_actions(self.parser.parse(item.raw_text))
         self.store.update_message(item)
         return self._format_created_reply(item)
+
+    def _handle_line_attachment(self, sender_id: str, source_type: str, message: dict[str, Any]) -> str:
+        message_id = message.get("id", "")
+        if not message_id:
+            return "收到附件了，但缺少 LINE 訊息編號，這次無法處理。"
+
+        try:
+            content, content_type = self._download_line_message_content(message_id)
+        except Exception as exc:
+            return f"附件下載失敗：{exc}"
+
+        item = self.store.find_active_draft(sender_id)
+        if item is None:
+            item = self.store.add_message(sender_id=sender_id, source_type=source_type, raw_text="")
+
+        filename = self._infer_line_filename(message, content_type)
+        saved_path = self._save_line_upload(filename, content)
+        item.uploaded_files.append(str(saved_path))
+
+        if saved_path.suffix.lower() == ".docx":
+            item.template_docx_path = str(saved_path)
+            if not item.raw_text.strip():
+                item.raw_text = f"[已上傳 Word 模板：{saved_path.name}]"
+            item.error = ""
+            self.store.update_message(item)
+            return self._format_template_reply(item, saved_path.name)
+
+        try:
+            extracted = self.attachment_reader.extract_text(saved_path.name, content)
+        except Exception as exc:
+            item.error = str(exc)
+            self.store.update_message(item)
+            return f"已收到附件 {saved_path.name}，但讀取失敗：{exc}"
+
+        item.raw_text = self._merge_text(item.raw_text, f"[附件：{saved_path.name}]\n{extracted}")
+        item.actions = self._enrich_actions(self.parser.parse(item.raw_text))
+        item.error = ""
+        self.store.update_message(item)
+        return self._format_attachment_reply(item, saved_path.name)
 
     def _resolve_docx_path(
         self,
         docx_path: str | None,
         uploaded_filename: str | None,
         uploaded_content: bytes | None,
+        fallback_item: InboxMessage | None = None,
     ) -> Path:
         if uploaded_filename and uploaded_content:
             suffix = Path(uploaded_filename).suffix.lower()
@@ -155,6 +217,9 @@ class LineMVPService:
 
         if docx_path and docx_path.strip():
             return Path(docx_path.strip())
+
+        if fallback_item and fallback_item.template_docx_path.strip():
+            return Path(fallback_item.template_docx_path.strip())
 
         env_path = os.getenv("SCHEDULE_DOCX_PATH", "").strip()
         if env_path:
@@ -214,8 +279,14 @@ class LineMVPService:
         if command == "approve":
             item.status = MessageStatus.APPROVED
             self.store.update_message(item)
+            template_hint = (
+                "已收到 Word 模板。"
+                if item.template_docx_path
+                else "目前還沒有 Word 模板，之後可先上傳 .docx 再套用。"
+            )
             return (
                 f"已確認行程，代碼 {self._message_code(item)}。\n"
+                f"{template_hint}\n"
                 f"若要正式寫入 Word，請回覆「套用 {self._message_code(item)}」。"
             )
 
@@ -320,20 +391,89 @@ class LineMVPService:
             return ""
         return f"{base_url}/files/{relative.as_posix()}"
 
+    def _download_line_message_content(self, message_id: str) -> tuple[bytes, str]:
+        token = os.getenv("LINE_CHANNEL_ACCESS_TOKEN", "").strip()
+        if not token:
+            raise ValueError("缺少 LINE_CHANNEL_ACCESS_TOKEN。")
+        req = request.Request(
+            f"https://api-data.line.me/v2/bot/message/{message_id}/content",
+            headers={"Authorization": f"Bearer {token}"},
+            method="GET",
+        )
+        with request.urlopen(req, timeout=20) as response:
+            content_type = response.headers.get("Content-Type", "application/octet-stream")
+            return response.read(), content_type
+
+    def _infer_line_filename(self, message: dict[str, Any], content_type: str) -> str:
+        message_type = message.get("type", "")
+        if message_type == "file":
+            file_name = message.get("fileName", "").strip()
+            if file_name:
+                return file_name
+        suffix = mimetypes.guess_extension(content_type.split(";")[0].strip()) or ""
+        if suffix == ".jpe":
+            suffix = ".jpg"
+        base = f"line_{message.get('id', 'upload')}"
+        return f"{base}{suffix}"
+
+    def _save_line_upload(self, filename: str, content: bytes) -> Path:
+        self.upload_dir.mkdir(parents=True, exist_ok=True)
+        safe_name = Path(filename).name or "line_upload.bin"
+        target = self.upload_dir / safe_name
+        stem = target.stem
+        suffix = target.suffix
+        counter = 1
+        while target.exists():
+            target = self.upload_dir / f"{stem}_{counter}{suffix}"
+            counter += 1
+        target.write_bytes(content)
+        return target
+
+    @staticmethod
+    def _merge_text(current: str, incoming: str) -> str:
+        base = current.strip()
+        extra = incoming.strip()
+        if not base:
+            return extra
+        if not extra:
+            return base
+        return f"{base}\n{extra}"
+
     def _format_created_reply(self, item: InboxMessage) -> str:
         code = self._message_code(item)
+        template_name = Path(item.template_docx_path).name if item.template_docx_path else "尚未上傳"
         if not item.actions:
             return (
                 f"已收到訊息，案件代碼 {code}。\n"
+                f"目前 Word 模板：{template_name}\n"
                 "目前尚未成功辨識出可用行程。\n"
-                f"請回覆「查看 {code}」檢查內容，或補充更完整的日期、時間與地點。"
+                f"你可以繼續傳行程、圖片、附件，或上傳 .docx 模板。\n"
+                f"請回覆「查看 {code}」檢查內容。"
             )
         first = item.actions[0]
         return (
             f"已收到並完成初步整理，案件代碼 {code}。\n"
+            f"目前 Word 模板：{template_name}\n"
             f"本次共解析 {len(item.actions)} 筆行程。\n"
             f"首筆內容：{first.date} {first.time or '時間待補'} {first.event or '行程待補'}\n"
             f"可直接回覆：查看 {code}、確認 {code}、略過 {code}、套用 {code}"
+        )
+
+    def _format_template_reply(self, item: InboxMessage, filename: str) -> str:
+        code = self._message_code(item)
+        action_count = len(item.actions)
+        return (
+            f"已收到 Word 模板 {filename}，案件代碼 {code}。\n"
+            f"目前已累積 {action_count} 筆行程。\n"
+            f"你可以繼續傳本次要寫入的 LINE 內容，整理好後回覆「確認 {code}」。"
+        )
+
+    def _format_attachment_reply(self, item: InboxMessage, filename: str) -> str:
+        code = self._message_code(item)
+        return (
+            f"已收到附件 {filename}，並加入本次整理，案件代碼 {code}。\n"
+            f"目前共整理 {len(item.actions)} 筆行程。\n"
+            f"你可以繼續補充內容，或回覆「查看 {code}」。"
         )
 
     def _format_item_summary(self, item: InboxMessage) -> str:
@@ -348,6 +488,7 @@ class LineMVPService:
         lines = [
             f"案件代碼：{code}",
             f"目前狀態：{status_labels.get(item.status, item.status.value)}",
+            f"Word 模板：{Path(item.template_docx_path).name if item.template_docx_path else '尚未上傳'}",
             f"原始內容：{item.raw_text[:120]}",
         ]
         if item.actions:
@@ -360,6 +501,8 @@ class LineMVPService:
             lines.append("目前尚未解析出可直接套用的行程。")
         if item.error:
             lines.append(f"系統備註：{item.error[:120]}")
+        if item.uploaded_files:
+            lines.append(f"附件數量：{len(item.uploaded_files)}")
         return "\n".join(lines)
 
     def _format_apply_reply(self, item: InboxMessage) -> str:
@@ -383,5 +526,5 @@ class LineMVPService:
             "確認 或 確認 代碼\n"
             "略過 或 略過 代碼\n"
             "套用 或 套用 代碼\n"
-            "你也可以直接傳送行程內容，系統會先整理後回覆案件代碼。"
+            "你也可以直接傳送行程內容，或上傳 .docx 模板，系統會先整理後回覆案件代碼。"
         )
