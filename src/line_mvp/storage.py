@@ -36,6 +36,14 @@ class InboxStore:
             return item
         return None
 
+    def find_active_draft(self, sender_id: str) -> InboxMessage | None:
+        for item in self.list_messages():
+            if item.sender_id != sender_id:
+                continue
+            if item.status == MessageStatus.PENDING:
+                return item
+        return None
+
     def add_message(self, sender_id: str, source_type: str, raw_text: str) -> InboxMessage:
         item = InboxMessage(
             id=str(uuid4()),
@@ -97,4 +105,6 @@ class InboxStore:
             error=item.get("error", ""),
             output_path=item.get("output_path", ""),
             preview_paths=list(item.get("preview_paths", [])),
+            template_docx_path=item.get("template_docx_path", ""),
+            uploaded_files=list(item.get("uploaded_files", [])),
         )
