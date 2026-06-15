@@ -31,6 +31,10 @@ TIME_TOKEN_RE = re.compile(
 NUMBER_PREFIX_RE = re.compile(r"^\s*\d+\s*[.)、]\s*")
 DATE_ONLY_DELETE_RE = re.compile(r"^\s*(?P<date>[^ ]+?)\s*(?:刪除|取消|移除)\s*$")
 WEEKDAY_RE = re.compile(r"[（(][一二三四五六日天][）)]")
+MULTI_DAY_LINE_RE = re.compile(
+    r"^\s*(?P<month>\d{1,2})/(?P<first_day>\d{1,2})(?P<more>(?:[、,，]\d{1,2})+)(?P<tail>.*)$"
+)
+DAY_ONLY_RE = re.compile(r"^\s*(?P<day>\d{1,2})(?=[^\d:：點])")
 
 
 def normalize_date(value: str | None, *, default_year: int | None = None) -> str:
@@ -120,7 +124,7 @@ def time_sort_key(value: str) -> tuple[int, int]:
 
 def clean_line(line: str) -> str:
     line = NUMBER_PREFIX_RE.sub("", line.strip())
-    line = line.lstrip("-•●").strip()
+    line = line.lstrip("-‧●").strip()
     return line
 
 
@@ -173,6 +177,11 @@ class MessageParser:
 
         for line in lines:
             current_date = self._update_current_date(line, current_date)
+            expanded = self._expand_multi_day_line(line)
+            if expanded:
+                actions.extend(expanded)
+                current_date = expanded[-1].date
+                continue
             delete_match = DATE_ONLY_DELETE_RE.match(line)
             if delete_match:
                 actions.append(
@@ -186,7 +195,7 @@ class MessageParser:
                 )
                 continue
 
-            date_in_line = self._extract_date(line) or current_date
+            date_in_line = self._extract_date(line, current_date=current_date) or current_date
             if not date_in_line:
                 continue
 
@@ -299,13 +308,17 @@ class MessageParser:
             )
         return actions
 
-    def _extract_date(self, text: str) -> str:
+    def _extract_date(self, text: str, current_date: str = "") -> str:
         match = DATE_TOKEN_RE.search(text)
         if match:
             return normalize_date(match.group("value"))
         compact_match = COMPACT_DATE_RE.search(text)
         if compact_match:
             return normalize_date(compact_match.group("value"))
+        if current_date:
+            inferred = self._infer_same_month_date(text, current_date)
+            if inferred:
+                return inferred
         return ""
 
     def _extract_time(self, text: str) -> str:
@@ -316,8 +329,61 @@ class MessageParser:
         return normalized if re.fullmatch(r"\d{2}:\d{2}", normalized) else ""
 
     def _update_current_date(self, line: str, current_date: str) -> str:
-        extracted = self._extract_date(line)
+        extracted = self._extract_date(line, current_date=current_date)
         return extracted or current_date
+
+    def _expand_multi_day_line(self, line: str) -> list[ScheduleAction]:
+        match = MULTI_DAY_LINE_RE.match(line)
+        if not match:
+            return []
+
+        month = int(match.group("month"))
+        day_values = [int(match.group("first_day"))]
+        day_values.extend(int(token) for token in re.findall(r"\d{1,2}", match.group("more")))
+        tail = match.group("tail").strip(" 、，,;；")
+        if not tail:
+            return []
+
+        time_text = self._extract_time(tail)
+        address = detect_address(tail)
+        note = detect_note(tail)
+        event = self._strip_multi_day_prefix(
+            line,
+            month=month,
+            days=day_values,
+            time_text=time_text,
+        )
+        if not event and not address and not note:
+            return []
+
+        actions: list[ScheduleAction] = []
+        for day in day_values:
+            actions.append(
+                ScheduleAction(
+                    action=ActionType.ADD,
+                    date=f"{month}/{day}",
+                    time=time_text,
+                    event=event,
+                    address=address,
+                    note=note,
+                    source_text=line,
+                    confidence=0.84 if time_text else 0.78,
+                    requires_review=True,
+                )
+            )
+        return actions
+
+    @staticmethod
+    def _infer_same_month_date(text: str, current_date: str) -> str:
+        match = re.fullmatch(r"(\d{1,2})/(\d{1,2})", normalize_date(current_date))
+        if not match:
+            return ""
+        month = int(match.group(1))
+        day_match = DAY_ONLY_RE.match(text.strip())
+        if not day_match:
+            return ""
+        day = int(day_match.group("day"))
+        return f"{month}/{day}"
 
     def _strip_known_tokens(self, text: str, date_text: str, time_text: str) -> str:
         result = text
@@ -349,6 +415,14 @@ class MessageParser:
         result = re.sub(r"[:：()（）]", " ", result)
         result = re.sub(r"\s+", " ", result).strip(" ，,;；")
         return result
+
+    def _strip_multi_day_prefix(self, text: str, month: int, days: list[int], time_text: str) -> str:
+        result = text
+        for index, day in enumerate(days):
+            if index == 0:
+                result = result.replace(f"{month}/{day}", " ", 1)
+            result = re.sub(rf"^[\s、,，]*{day}(?!\d)", " ", result, count=1)
+        return self._strip_known_tokens(result, "", time_text)
 
     def _openai_parse(self, message: str) -> list[ScheduleAction]:
         client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
