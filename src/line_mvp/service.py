@@ -4,6 +4,7 @@ import hmac
 import json
 import mimetypes
 import os
+import threading
 from base64 import b64encode
 from dataclasses import asdict, replace
 from hashlib import sha256
@@ -21,6 +22,8 @@ from .word_editor import ScheduleWordEditor
 
 
 class LineMVPService:
+    APPLYING_MARKER = "[APPLYING]"
+
     def __init__(self, base_dir: str | Path):
         self.base_dir = Path(base_dir)
         self.data_dir = self.base_dir / "data" / "line_mvp"
@@ -278,6 +281,7 @@ class LineMVPService:
 
         if command == "approve":
             item.status = MessageStatus.APPROVED
+            item.error = ""
             self.store.update_message(item)
             template_hint = (
                 "已收到 Word 模板。"
@@ -294,6 +298,7 @@ class LineMVPService:
 
         if command == "skip":
             item.status = MessageStatus.SKIPPED
+            item.error = ""
             self.store.update_message(item)
             return (
                 "系統狀態更新：本次草稿已標記為略過。\n"
@@ -302,20 +307,59 @@ class LineMVPService:
             )
 
         if command == "apply":
-            try:
-                applied = self.apply_to_word(item.id)
-            except Exception as exc:
-                item.status = MessageStatus.ERROR
-                item.error = str(exc)
-                self.store.update_message(item)
+            if item.error.startswith(self.APPLYING_MARKER):
                 return (
-                    f"寫入 Word 失敗：{exc}\n"
-                    "請確認 Render 已設定 SCHEDULE_DOCX_PATH，且伺服器可以讀取該 .docx 檔案。"
+                    "系統狀態：這一筆案件正在背景處理中。\n"
+                    f"案件代碼：{self._message_code(item)}\n"
+                    "請稍候，完成後我會主動把 Word 與預覽圖推送回 LINE。"
                 )
-            self._push_apply_assets(sender_id, applied)
-            return self._format_apply_reply(applied)
+
+            if not item.template_docx_path.strip() and not os.getenv("SCHEDULE_DOCX_PATH", "").strip():
+                return (
+                    "目前還沒有可套用的 Word 模板。\n"
+                    f"案件代碼：{self._message_code(item)}\n"
+                    "請先上傳這次要修改的 .docx 檔，再重新輸入「套用」。"
+                )
+
+            item.error = f"{self.APPLYING_MARKER} background apply started"
+            self.store.update_message(item)
+            self._start_apply_job(sender_id, item.id)
+            return (
+                "系統狀態更新：已收到套用指令，正在背景處理。\n"
+                f"案件代碼：{self._message_code(item)}\n"
+                "我會先自動檢查整份 Word、補齊日期、校正星期，再寫入行程。\n"
+                "完成後會自動把 Word 與 JPG 預覽推送回 LINE，這段時間不用再重複輸入「套用」。"
+            )
 
         return self._help_text()
+
+    def _start_apply_job(self, sender_id: str, message_id: str) -> None:
+        worker = threading.Thread(
+            target=self._run_apply_job,
+            args=(sender_id, message_id),
+            daemon=True,
+        )
+        worker.start()
+
+    def _run_apply_job(self, sender_id: str, message_id: str) -> None:
+        try:
+            applied = self.apply_to_word(message_id)
+        except Exception as exc:
+            item = self._require(message_id)
+            item.status = MessageStatus.ERROR
+            item.error = str(exc)
+            self.store.update_message(item)
+            self._push_text_message(
+                sender_id,
+                (
+                    "系統通知：Word 套用失敗。\n"
+                    f"案件代碼：{self._message_code(item)}\n"
+                    f"錯誤原因：{exc}"
+                ),
+            )
+            return
+
+        self._push_apply_assets(sender_id, applied)
 
     def _reply_line_message(self, reply_token: str, text: str) -> bool:
         token = os.getenv("LINE_CHANNEL_ACCESS_TOKEN", "").strip()
@@ -331,6 +375,24 @@ class LineMVPService:
         )
         try:
             with request.urlopen(req, timeout=10) as response:
+                return 200 <= response.status < 300
+        except error.URLError:
+            return False
+
+    def _push_text_message(self, to: str, text: str) -> bool:
+        token = os.getenv("LINE_CHANNEL_ACCESS_TOKEN", "").strip()
+        if not token or not to or not text:
+            return False
+        req = self._make_line_request(
+            "https://api.line.me/v2/bot/message/push",
+            token,
+            {
+                "to": to,
+                "messages": [{"type": "text", "text": text[:5000]}],
+            },
+        )
+        try:
+            with request.urlopen(req, timeout=15) as response:
                 return 200 <= response.status < 300
         except error.URLError:
             return False
