@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import threading
 from dataclasses import asdict
 from datetime import datetime
 from pathlib import Path
@@ -12,12 +13,14 @@ from .models import ActionType, InboxMessage, MessageStatus, ScheduleAction
 class InboxStore:
     def __init__(self, path: str | Path):
         self.path = Path(path)
+        self._lock = threading.RLock()
         self.path.parent.mkdir(parents=True, exist_ok=True)
         if not self.path.exists():
             self.path.write_text("[]", encoding="utf-8")
 
     def list_messages(self) -> list[InboxMessage]:
-        return [self._from_dict(item) for item in json.loads(self.path.read_text(encoding="utf-8"))]
+        with self._lock:
+            return [self._from_dict(item) for item in json.loads(self.path.read_text(encoding="utf-8"))]
 
     def get_message(self, message_id: str) -> InboxMessage | None:
         for item in self.list_messages():
@@ -52,18 +55,20 @@ class InboxStore:
             source_type=source_type,
             raw_text=raw_text,
         )
-        items = self.list_messages()
-        items.insert(0, item)
-        self._save(items)
+        with self._lock:
+            items = self.list_messages()
+            items.insert(0, item)
+            self._save(items)
         return item
 
     def update_message(self, updated: InboxMessage) -> None:
-        items = self.list_messages()
-        for index, item in enumerate(items):
-            if item.id == updated.id:
-                items[index] = updated
-                self._save(items)
-                return
+        with self._lock:
+            items = self.list_messages()
+            for index, item in enumerate(items):
+                if item.id == updated.id:
+                    items[index] = updated
+                    self._save(items)
+                    return
         raise KeyError(updated.id)
 
     def _save(self, items: list[InboxMessage]) -> None:
@@ -77,7 +82,9 @@ class InboxStore:
                 action_raw["action"] = action.action.value
                 raw["actions"].append(action_raw)
             payload.append(raw)
-        self.path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        temp_path = self.path.with_suffix(f"{self.path.suffix}.tmp")
+        temp_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        temp_path.replace(self.path)
 
     @staticmethod
     def _from_dict(item: dict) -> InboxMessage:
@@ -107,4 +114,8 @@ class InboxStore:
             preview_paths=list(item.get("preview_paths", [])),
             template_docx_path=item.get("template_docx_path", ""),
             uploaded_files=list(item.get("uploaded_files", [])),
+            processing=bool(item.get("processing", False)),
+            apply_attempts=int(item.get("apply_attempts", 0)),
+            last_error=item.get("last_error", ""),
+            last_progress_at=item.get("last_progress_at", ""),
         )

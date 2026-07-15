@@ -45,6 +45,10 @@ class InboxMessage:
     preview_paths: list[str] = field(default_factory=list)
     template_docx_path: str = ""
     uploaded_files: list[str] = field(default_factory=list)
+    processing: bool = False
+    apply_attempts: int = 0
+    last_error: str = ""
+    last_progress_at: str = ""
 
 
 @dataclass(slots=True)

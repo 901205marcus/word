@@ -22,6 +22,11 @@ OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 app.mount("/files", StaticFiles(directory=str(OUTPUT_DIR)), name="files")
 
 
+@app.on_event("startup")
+def startup_recover_jobs():
+    service.recover_pending_jobs()
+
+
 @app.get("/health")
 def health():
     return {"ok": True}
