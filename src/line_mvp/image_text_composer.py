@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import os
 from pathlib import Path
 
@@ -7,8 +8,21 @@ from PIL import Image, ImageDraw, ImageFont, ImageOps
 
 
 class ImageTextComposer:
-    def __init__(self, max_dimension: int = 2048):
-        self.max_dimension = max_dimension
+    def __init__(
+        self,
+        max_dimension: int | None = None,
+        max_output_bytes: int | None = None,
+    ):
+        configured_dimension = int(os.getenv("OVERLAY_MAX_DIMENSION", "4096"))
+        selected_dimension = configured_dimension if max_dimension is None else max_dimension
+        self.max_dimension = max(1200, selected_dimension)
+        configured_mb = float(os.getenv("OVERLAY_MAX_OUTPUT_MB", "9"))
+        selected_bytes = (
+            int(configured_mb * 1024 * 1024)
+            if max_output_bytes is None
+            else max_output_bytes
+        )
+        self.max_output_bytes = max(64 * 1024, selected_bytes)
 
     def compose(self, image_path: str | Path, text: str, output_path: str | Path) -> str:
         caption = text.strip()
@@ -23,15 +37,14 @@ class ImageTextComposer:
         output.parent.mkdir(parents=True, exist_ok=True)
 
         with Image.open(source) as opened:
-            image = ImageOps.exif_transpose(opened).convert("RGBA")
+            image = ImageOps.exif_transpose(opened).convert("RGB")
 
         image.thumbnail((self.max_dimension, self.max_dimension), Image.Resampling.LANCZOS)
         width, height = image.size
         if width < 120 or height < 120:
             raise ValueError("照片尺寸太小，無法清楚放上文字。")
 
-        overlay = Image.new("RGBA", image.size, (0, 0, 0, 0))
-        draw = ImageDraw.Draw(overlay)
+        draw = ImageDraw.Draw(image)
         font, lines, spacing, _text_bbox = self._fit_text(draw, caption, width, height)
 
         center_x = width / 2
@@ -42,17 +55,52 @@ class ImageTextComposer:
             (center_x, center_y),
             "\n".join(lines),
             font=font,
-            fill=(255, 255, 255, 255),
+            fill=(255, 255, 255),
             anchor="mm",
             align="center",
             spacing=spacing,
             stroke_width=stroke_width,
-            stroke_fill=(0, 0, 0, 235),
+            stroke_fill=(0, 0, 0),
         )
 
-        result = Image.alpha_composite(image, overlay).convert("RGB")
-        result.save(output, format="JPEG", quality=91, optimize=True, progressive=True)
+        self._save_for_line(image, output)
         return str(output)
+
+    def _save_for_line(self, image: Image.Image, output: Path) -> None:
+        for quality in (92, 88, 84, 80, 76, 72):
+            image.save(output, format="JPEG", quality=quality, optimize=False, progressive=True)
+            if output.stat().st_size <= self.max_output_bytes:
+                return
+
+        # Keep the original pixel dimensions unless compression cannot meet LINE's limit.
+        resized = image
+        for _ in range(8):
+            ratio = math.sqrt(
+                self.max_output_bytes / max(1, output.stat().st_size)
+            ) * 0.92
+            ratio = max(0.5, min(0.92, ratio))
+            next_size = (
+                max(120, int(resized.width * ratio)),
+                max(120, int(resized.height * ratio)),
+            )
+            if next_size == resized.size:
+                break
+            resized = resized.resize(
+                next_size,
+                Image.Resampling.LANCZOS,
+            )
+            for quality in (84, 78, 72, 66):
+                resized.save(
+                    output,
+                    format="JPEG",
+                    quality=quality,
+                    optimize=False,
+                    progressive=True,
+                )
+                if output.stat().st_size <= self.max_output_bytes:
+                    return
+
+        raise ValueError("圖片壓縮後仍超過 LINE 可回傳容量，請改用較小的原圖。")
 
     def _fit_text(
         self,

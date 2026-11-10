@@ -142,13 +142,10 @@ class ServiceRegressionTests(unittest.TestCase):
         (self.tempdir / "data" / "line_mvp").mkdir(parents=True, exist_ok=True)
         (self.tempdir / "outputs").mkdir(parents=True, exist_ok=True)
         self.service = LineMVPService(self.tempdir)
-        self.service.overlay_image_settle_seconds = 0.05
 
     def tearDown(self) -> None:
         deadline = time.monotonic() + 5
-        while (
-            self.service._active_overlay_jobs or self.service._active_overlay_retry_jobs
-        ) and time.monotonic() < deadline:
+        while self.service._active_overlay_jobs and time.monotonic() < deadline:
             time.sleep(0.01)
         shutil.rmtree(self.tempdir, ignore_errors=True)
 
@@ -157,15 +154,6 @@ class ServiceRegressionTests(unittest.TestCase):
         while sender_id in self.service._active_overlay_jobs and time.monotonic() < deadline:
             time.sleep(0.01)
         self.assertNotIn(sender_id, self.service._active_overlay_jobs)
-
-    def wait_for_overlay_retry_job(self, sender_id: str, timeout: float = 5) -> None:
-        deadline = time.monotonic() + timeout
-        while (
-            sender_id in self.service._active_overlay_retry_jobs
-            and time.monotonic() < deadline
-        ):
-            time.sleep(0.01)
-        self.assertNotIn(sender_id, self.service._active_overlay_retry_jobs)
 
     def make_item(self) -> InboxMessage:
         item = self.service.store.add_message("user-1", "manual", "7/20 10:00 測試行程")
@@ -256,6 +244,7 @@ class ServiceRegressionTests(unittest.TestCase):
                 "event_id": "saved-image-event",
             }
         ]
+        session.batch_requested = True
         self.service.overlay_store.update(session)
         started: list[str] = []
 
@@ -266,8 +255,108 @@ class ServiceRegressionTests(unittest.TestCase):
         ):
             recovered = self.service.recover_overlay_jobs()
 
-        self.assertEqual(0, recovered)
-        self.assertEqual([], started)
+        self.assertEqual(1, recovered)
+        self.assertEqual(["recover-overlay-user"], started)
+
+    def test_recover_overlay_jobs_finishes_saved_batch(self) -> None:
+        sender_id = "recover-overlay-real-user"
+        self.service._handle_line_text(sender_id, "user", "加字模式")
+        self.service._handle_line_text(
+            sender_id,
+            "user",
+            "重新啟動後繼續",
+            event_timestamp=1_000,
+            message_id="101",
+        )
+        source = self.tempdir / "recover-source.jpg"
+        Image.new("RGB", (800, 600), (60, 100, 140)).save(source)
+        session = self.service.overlay_store.get(sender_id)
+        session.image_queue = [
+            {
+                "path": str(source),
+                "at": datetime.now().isoformat(),
+                "event_timestamp": "2000",
+                "message_id": "201",
+                "event_id": "recover-image-event",
+            }
+        ]
+        session.batch_requested = True
+        session.batch_processing = True
+        self.service.overlay_store.update(session)
+
+        def fake_compose(image_path: str, text: str, output_path: Path) -> str:
+            self.assertEqual("重新啟動後繼續", text)
+            Path(output_path).write_bytes(b"generated-jpeg")
+            return str(output_path)
+
+        with patch.object(
+            self.service.image_text_composer,
+            "compose",
+            side_effect=fake_compose,
+        ), patch.object(
+            self.service,
+            "_push_image_message",
+            return_value=True,
+        ), patch.object(
+            self.service,
+            "_push_line_overlay_choice",
+            return_value=True,
+        ):
+            recovered = self.service.recover_overlay_jobs()
+            self.wait_for_overlay_job(sender_id)
+
+        self.assertEqual(1, recovered)
+        updated = self.service.overlay_store.get(sender_id)
+        self.assertEqual(1, updated.completed_count)
+        self.assertEqual([], updated.text_queue)
+        self.assertEqual([], updated.image_queue)
+        self.assertFalse(updated.batch_requested)
+        self.assertFalse(updated.batch_processing)
+
+    def test_overlay_batch_failure_preserves_the_same_text_and_image(self) -> None:
+        sender_id = "preserve-failed-pair-user"
+        self.service._handle_line_text(sender_id, "user", "加字模式")
+        self.service._handle_line_text(
+            sender_id,
+            "user",
+            "紅花",
+            event_timestamp=1_000,
+            message_id="101",
+        )
+        source = self.tempdir / "failed-pair.jpg"
+        Image.new("RGB", (800, 600), (60, 100, 140)).save(source)
+        session = self.service.overlay_store.get(sender_id)
+        session.image_queue = [
+            {
+                "path": str(source),
+                "at": datetime.now().isoformat(),
+                "event_timestamp": "2000",
+                "message_id": "201",
+                "event_id": "failed-pair-event",
+            }
+        ]
+        session.batch_requested = True
+        self.service.overlay_store.update(session)
+
+        with patch.object(
+            self.service.image_text_composer,
+            "compose",
+            side_effect=RuntimeError("temporary compose failure"),
+        ), patch.object(
+            self.service,
+            "_push_line_overlay_choice",
+            return_value=True,
+        ):
+            self.service._start_overlay_batch_job(sender_id)
+            self.wait_for_overlay_job(sender_id)
+
+        updated = self.service.overlay_store.get(sender_id)
+        self.assertEqual(["紅花"], [part["text"] for part in updated.text_queue])
+        self.assertEqual([str(source)], [part["path"] for part in updated.image_queue])
+        self.assertEqual(0, updated.completed_count)
+        self.assertFalse(updated.batch_requested)
+        self.assertFalse(updated.batch_processing)
+        self.assertIn("合成失敗", updated.last_error)
 
     def test_run_apply_job_retries_then_succeeds(self) -> None:
         item = self.make_item()
@@ -318,7 +407,7 @@ class ServiceRegressionTests(unittest.TestCase):
             )
             self.wait_for_overlay_job("user-1")
 
-        self.assertIn("第 1 組完成", reply)
+        self.assertIn("照片已收齊", reply)
         session = self.service.overlay_store.get("user-1")
         self.assertTrue(session.active)
         self.assertTrue(Path(session.output_path).exists())
@@ -452,7 +541,7 @@ class ServiceRegressionTests(unittest.TestCase):
                     event_timestamp=2_000,
                     event_id="image-event-2",
                 )
-                self.assertEqual([(b"later-image", "第一段")], composed)
+                self.assertEqual([], composed)
             with patch.object(
                 self.service,
                 "_download_line_message_content",
@@ -468,12 +557,12 @@ class ServiceRegressionTests(unittest.TestCase):
             self.wait_for_overlay_job("ordered-user")
 
         self.assertEqual(
-            [(b"later-image", "第一段"), (b"earlier-image", "第二段")],
+            [(b"earlier-image", "第一段"), (b"later-image", "第二段")],
             composed,
         )
-        self.assertIn("第 1 組完成", first_reply)
-        self.assertIn("第 2 組完成", final_reply)
-        choice_mock.assert_not_called()
+        self.assertIn("安全保存", first_reply)
+        self.assertIn("照片已收齊", final_reply)
+        choice_mock.assert_called_once()
 
     def test_partial_overlay_batch_processes_without_waiting_for_all_images(self) -> None:
         composed: list[str] = []
@@ -507,17 +596,23 @@ class ServiceRegressionTests(unittest.TestCase):
                 event_timestamp=1_000,
                 event_id="partial-image-event",
             )
+            start_reply = self.service._handle_line_text(
+                "partial-user",
+                "user",
+                "開始合成",
+            )
             self.wait_for_overlay_job("partial-user")
 
-        self.assertIn("第 1 組完成", reply)
+        self.assertIn("安全保存", reply)
+        self.assertIn("可處理 1 組", start_reply)
         self.assertEqual(["第一段"], composed)
         session = self.service.overlay_store.get("partial-user")
         self.assertEqual(["第二段"], [part["text"] for part in session.text_queue])
         self.assertEqual([], session.image_queue)
         text_mock.assert_not_called()
-        choice_mock.assert_not_called()
+        choice_mock.assert_called_once()
 
-    def test_overlay_images_are_processed_without_a_background_queue(self) -> None:
+    def test_overlay_images_are_sorted_in_a_bounded_background_batch(self) -> None:
         self.service._handle_line_text("parallel-user", "user", "加字模式")
         self.service._handle_line_text("parallel-user", "user", "第一段")
         self.service._handle_line_text("parallel-user", "user", "第二段")
@@ -558,8 +653,9 @@ class ServiceRegressionTests(unittest.TestCase):
                     ),
                 ]
                 replies = [future.result(timeout=2) for future in futures]
+            self.wait_for_overlay_job("parallel-user")
 
-        self.assertTrue(all("組完成" in reply for reply in replies))
+        self.assertTrue(all("照片" in reply for reply in replies))
         session = self.service.overlay_store.get("parallel-user")
         self.assertEqual(2, session.completed_count)
         self.assertEqual([], session.text_queue)
@@ -587,7 +683,7 @@ class ServiceRegressionTests(unittest.TestCase):
             side_effect=fake_compose,
         ), patch.object(
             self.service, "_push_image_message", side_effect=fake_push
-        ), patch.object(self.service, "_start_overlay_output_retry_job", return_value=None):
+        ):
             self.service._create_overlay_from_image(
                 "priority-user",
                 session,
@@ -600,8 +696,6 @@ class ServiceRegressionTests(unittest.TestCase):
         self.assertEqual(["old-1.jpg", "old-2.jpg"], updated.pending_outputs)
 
     def test_failed_overlay_push_is_recorded_without_background_retry(self) -> None:
-        self.service.overlay_retry_delay = 0.01
-        self.service.overlay_retry_attempts = 3
         self.service._handle_line_text("retry-user", "user", "加字模式")
         self.service._handle_line_text("retry-user", "user", "自動補送")
         session = self.service.overlay_store.get("retry-user")
@@ -625,7 +719,6 @@ class ServiceRegressionTests(unittest.TestCase):
                 session,
                 self.tempdir / "source.jpg",
             )
-            self.wait_for_overlay_retry_job("retry-user")
 
         updated = self.service.overlay_store.get("retry-user")
         self.assertEqual(1, len(updated.pending_outputs))
@@ -676,6 +769,7 @@ class ServiceRegressionTests(unittest.TestCase):
 
     def test_overlay_start_cleans_legacy_queue_and_missing_outputs(self) -> None:
         session = self.service.overlay_store.get_or_create("legacy-user")
+        session.queue_version = 0
         valid_output = self.tempdir / "outputs" / "valid.jpg"
         valid_output.write_bytes(b"valid")
         session.image_queue = [{"path": "old-image.jpg"}]
@@ -699,7 +793,6 @@ class ServiceRegressionTests(unittest.TestCase):
         self.assertEqual(["補送圖片", "繼續貼字", "回到行程模式"], labels)
 
     def test_complete_overlay_batch_skips_settle_delay(self) -> None:
-        self.service.overlay_image_settle_seconds = 2.0
         self.service._handle_line_text("fast-user", "user", "加字模式")
         self.service._handle_line_text("fast-user", "user", "立即處理")
 
@@ -729,7 +822,7 @@ class ServiceRegressionTests(unittest.TestCase):
             self.wait_for_overlay_job("fast-user", timeout=1)
 
         self.assertLess(time.monotonic() - started_at, 1)
-        self.assertIn("第 1 組完成", reply)
+        self.assertIn("照片已收齊", reply)
         self.assertNotIn("背景", reply)
 
     def test_overlay_image_redelivery_is_not_queued_twice(self) -> None:
@@ -765,11 +858,11 @@ class ServiceRegressionTests(unittest.TestCase):
                 event_id="same-image-event",
             )
 
-        self.assertIn("第 1 組完成", first)
+        self.assertIn("安全保存", first)
         self.assertIn("不會重複配對", duplicate)
         self.assertEqual(1, download_mock.call_count)
         session = self.service.overlay_store.get("image-duplicate-user")
-        self.assertEqual([], session.image_queue)
+        self.assertEqual(1, len(session.image_queue))
 
     def test_overlay_redelivery_does_not_duplicate_text(self) -> None:
         self.service._handle_line_text("duplicate-user", "user", "加字模式")
@@ -829,7 +922,7 @@ class ServiceRegressionTests(unittest.TestCase):
                 {"id": "image-2-retry", "type": "image"},
             )
             self.wait_for_overlay_job("user-2")
-        self.assertIn("第 1 組完成", reply)
+        self.assertIn("照片已收齊", reply)
 
     def test_twenty_batched_texts_then_images_stay_one_to_one_in_order(self) -> None:
         composed: list[tuple[bytes, str]] = []
@@ -880,7 +973,71 @@ class ServiceRegressionTests(unittest.TestCase):
         self.assertEqual(20, session.completed_count)
         self.assertEqual([], session.text_queue)
         self.assertEqual([], session.image_queue)
-        choice_mock.assert_not_called()
+        choice_mock.assert_called_once()
+
+    def test_more_than_one_worker_batch_shows_choices_only_after_all_images(self) -> None:
+        sender_id = "large-bounded-batch-user"
+        self.service._handle_line_text(sender_id, "user", "加字模式")
+        session = self.service.overlay_store.get(sender_id)
+        session.text_queue = [
+            {
+                "text": f"文字 {index}",
+                "at": datetime.now().isoformat(),
+                "event_timestamp": str(1_000 + index),
+                "message_id": str(10_000 + index),
+                "event_id": f"text-{index}",
+            }
+            for index in range(101)
+        ]
+        session.image_queue = [
+            {
+                "path": str(self.tempdir / f"image-{index}.jpg"),
+                "at": datetime.now().isoformat(),
+                "event_timestamp": str(2_000 + index),
+                "message_id": str(20_000 + index),
+                "event_id": f"image-{index}",
+            }
+            for index in range(101)
+        ]
+        session.batch_requested = True
+        self.service.overlay_store.update(session)
+
+        def fake_compose(image_path: str, text: str, output_path: Path) -> str:
+            Path(output_path).write_bytes(b"generated-jpeg")
+            return str(output_path)
+
+        with patch.object(
+            self.service.image_text_composer,
+            "compose",
+            side_effect=fake_compose,
+        ), patch.object(
+            self.service,
+            "_push_image_message",
+            return_value=True,
+        ), patch.object(
+            self.service,
+            "_push_text_message",
+            return_value=True,
+        ) as progress_mock, patch.object(
+            self.service,
+            "_push_line_overlay_choice",
+            return_value=True,
+        ) as choice_mock:
+            self.service._start_overlay_batch_job(sender_id)
+            deadline = time.monotonic() + 10
+            while time.monotonic() < deadline:
+                updated = self.service.overlay_store.get(sender_id)
+                if updated.completed_count == 101 and not updated.batch_processing:
+                    break
+                time.sleep(0.01)
+            self.wait_for_overlay_job(sender_id, timeout=10)
+
+        updated = self.service.overlay_store.get(sender_id)
+        self.assertEqual(101, updated.completed_count)
+        self.assertEqual([], updated.text_queue)
+        self.assertEqual([], updated.image_queue)
+        progress_mock.assert_called_once()
+        choice_mock.assert_called_once()
 
     def test_overlay_mode_is_separate_from_schedule_messages(self) -> None:
         schedule_reply = self.service._handle_line_text(
@@ -920,6 +1077,25 @@ class ServiceRegressionTests(unittest.TestCase):
         self.assertFalse(session.active)
         self.assertEqual([], session.text_queue)
 
+    def test_overlay_texts_do_not_expire_by_default(self) -> None:
+        self.service.overlay_pair_seconds = 0
+        session = self.service.overlay_store.get_or_create("no-expiry-user")
+        session.active = True
+        session.text_queue = [
+            {
+                "text": "保留到我主動結束",
+                "at": "2020-01-01T00:00:00",
+                "event_timestamp": "1000",
+                "message_id": "101",
+                "event_id": "old-text-event",
+            }
+        ]
+
+        expired = self.service._prune_overlay_texts(session)
+
+        self.assertEqual(0, expired)
+        self.assertEqual("保留到我主動結束", session.text_queue[0]["text"])
+
 
 class ImageTextComposerTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -950,7 +1126,7 @@ class ImageTextComposerTests(unittest.TestCase):
             pixel_count = upper_center.width * upper_center.height
             self.assertLess(dark_pixels / pixel_count, 0.16)
 
-    def test_default_line_image_uses_stable_line_size_limit(self) -> None:
+    def test_default_line_image_preserves_safe_original_dimensions(self) -> None:
         source = self.tempdir / "large-source.jpg"
         output = self.tempdir / "large-result.jpg"
         Image.new("RGB", (3200, 2400), (70, 110, 150)).save(source, quality=95)
@@ -958,7 +1134,7 @@ class ImageTextComposerTests(unittest.TestCase):
         ImageTextComposer().compose(source, "快速回傳", output)
 
         with Image.open(output) as result:
-            self.assertEqual((2048, 1536), result.size)
+            self.assertEqual((3200, 2400), result.size)
 
     def test_optional_max_dimension_still_allows_manual_size_limit(self) -> None:
         source = self.tempdir / "manual-limit-source.jpg"
@@ -981,6 +1157,21 @@ class ImageTextComposerTests(unittest.TestCase):
         with Image.open(output) as result:
             self.assertEqual((1600, 1200), result.size)
         self.assertGreater(output.stat().st_size, 0)
+
+    def test_oversized_output_is_bounded_only_when_needed(self) -> None:
+        source = self.tempdir / "oversized-source.jpg"
+        output = self.tempdir / "oversized-result.jpg"
+        channels = [Image.effect_noise((1800, 1400), 120) for _ in range(3)]
+        Image.merge("RGB", channels).save(source, quality=98)
+
+        ImageTextComposer(max_output_bytes=220_000).compose(source, "紅花", output)
+
+        self.assertLessEqual(output.stat().st_size, 220_000)
+        with Image.open(output) as result:
+            self.assertLessEqual(result.width, 1800)
+            self.assertLessEqual(result.height, 1400)
+            self.assertGreaterEqual(result.width, 120)
+            self.assertGreaterEqual(result.height, 120)
 
     def test_bundled_font_contains_distinct_traditional_chinese_glyphs(self) -> None:
         font = ImageTextComposer._load_font(72)

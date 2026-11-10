@@ -60,6 +60,9 @@ class OverlaySession:
     image_queue: list[dict[str, str]] = field(default_factory=list)
     seen_image_event_ids: list[str] = field(default_factory=list)
     pending_outputs: list[str] = field(default_factory=list)
+    queue_version: int = 2
+    batch_requested: bool = False
+    batch_processing: bool = False
     completed_count: int = 0
     output_path: str = ""
     last_error: str = ""

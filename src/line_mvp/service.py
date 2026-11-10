@@ -41,6 +41,7 @@ class LineMVPService:
         "overlay_cancel",
         "overlay_status",
         "overlay_retry",
+        "overlay_process",
         "schedule_mode",
     }
 
@@ -57,7 +58,7 @@ class LineMVPService:
         self.preview_renderer = DocxPreviewRenderer()
         self.image_text_composer = ImageTextComposer()
         self.rich_menu_manager = LineRichMenuManager(self.base_dir)
-        self.overlay_pair_seconds = max(60, int(os.getenv("OVERLAY_PAIR_SECONDS", "1800")))
+        self.overlay_pair_seconds = max(0, int(os.getenv("OVERLAY_PAIR_SECONDS", "0")))
         self.apply_retry_delay = max(3, int(os.getenv("LINE_APPLY_RETRY_DELAY", "5")))
         self.apply_retry_max_delay = max(
             self.apply_retry_delay,
@@ -69,9 +70,8 @@ class LineMVPService:
         self._active_jobs: set[str] = set()
         self._sender_locks_guard = threading.Lock()
         self._sender_locks: dict[str, threading.RLock] = {}
-        # Kept as empty compatibility markers; image overlays no longer start workers.
+        self._overlay_job_lock = threading.Lock()
         self._active_overlay_jobs: set[str] = set()
-        self._active_overlay_retry_jobs: set[str] = set()
 
     def verify_signature(self, body: bytes, signature: str) -> bool:
         secret = os.getenv("LINE_CHANNEL_SECRET", "").strip()
@@ -240,7 +240,16 @@ class LineMVPService:
         return recovered
 
     def recover_overlay_jobs(self) -> int:
-        return 0
+        recovered = 0
+        for session in self.overlay_store.list_sessions():
+            if not session.batch_requested:
+                continue
+            session.batch_processing = False
+            self.overlay_store.update(session)
+            if session.active and session.text_queue and session.image_queue:
+                self._start_overlay_batch_job(session.sender_id)
+                recovered += 1
+        return recovered
 
     def _handle_line_event(
         self,
@@ -452,6 +461,11 @@ class LineMVPService:
                 )
             if event_id and event_id in overlay_session.seen_image_event_ids:
                 return "這張照片已經處理過，不會重複配對文字。"
+            if len(overlay_session.image_queue) >= len(overlay_session.text_queue):
+                return (
+                    "本批照片數量已等於待配文字數量，這張照片沒有加入。\n"
+                    "請等待合成完成，或先新增下一段文字。"
+                )
             try:
                 content, content_type = self._download_line_message_content(message_id)
             except Exception as exc:
@@ -459,12 +473,38 @@ class LineMVPService:
 
             filename = self._infer_line_filename(message, content_type)
             saved_path = self._save_upload(filename, content)
-            result = self._create_overlay_from_image(sender_id, overlay_session, saved_path)
-            if event_id and "圖片文字合成失敗" not in result:
+            overlay_session.image_queue.append(
+                {
+                    "path": str(saved_path),
+                    "at": self._now_iso(),
+                    "event_timestamp": str(event_timestamp or ""),
+                    "message_id": str(message_id),
+                    "event_id": event_id,
+                }
+            )
+            if event_id:
                 overlay_session.seen_image_event_ids.append(event_id)
                 overlay_session.seen_image_event_ids = overlay_session.seen_image_event_ids[-500:]
-                self.overlay_store.update(overlay_session)
-            return result
+            self._sort_overlay_image_queue(overlay_session)
+            received = len(overlay_session.image_queue)
+            expected = len(overlay_session.text_queue)
+            auto_started = received >= expected
+            if auto_started:
+                overlay_session.batch_requested = True
+            overlay_session.updated_at = self._now_iso()
+            overlay_session.last_error = ""
+            self.overlay_store.update(overlay_session)
+            if auto_started:
+                self._start_overlay_batch_job(sender_id)
+                return (
+                    f"照片已收齊：{received}/{expected} 張。\n"
+                    "已依 LINE 傳送時間排序並開始安全批次合成。\n"
+                    "系統會逐張回傳；可輸入「加字狀態」查看進度。"
+                )
+            return (
+                f"照片已安全保存：{received}/{expected} 張。\n"
+                "請繼續依序傳照片；若只想先處理目前照片，可輸入「開始合成」。"
+            )
 
         try:
             content, content_type = self._download_line_message_content(message_id)
@@ -571,6 +611,9 @@ class LineMVPService:
             "補送圖片": "overlay_retry",
             "重試圖片": "overlay_retry",
             "重試回傳": "overlay_retry",
+            "/開始合成": "overlay_process",
+            "開始合成": "overlay_process",
+            "完成上傳": "overlay_process",
             "查看": "view",
             "檢視": "view",
             "view": "view",
@@ -678,7 +721,8 @@ class LineMVPService:
                 "步驟 1：先依順序傳完所有文字，每則 LINE 訊息算一段。\n"
                 "步驟 2：再依相同順序傳送照片。\n"
                 "配對規則：第 1 段文字＋第 1 張照片，依此類推。\n"
-                f"目前等待文字：{len(session.text_queue)} 段。完成後輸入「結束加字」。"
+                "文字與照片數量相同時會自動開始；若只想先做目前的配對，輸入「開始合成」。\n"
+                f"目前文字 {len(session.text_queue)} 段、照片 {len(session.image_queue)} 張。"
             ]
             if cleared_images or missing_outputs:
                 lines.append(
@@ -694,8 +738,8 @@ class LineMVPService:
             self.overlay_store.update(session)
             return (
                 "已繼續貼字模式，本批紀錄保留。\n"
-                f"目前尚待照片：{len(session.text_queue)} 段文字。\n"
-                "可繼續傳文字或照片；完成後仍會再次顯示模式選項。"
+                f"目前文字 {len(session.text_queue)} 段、照片 {len(session.image_queue)} 張。\n"
+                "可繼續先傳文字、再傳照片；完成後會再次顯示模式選項。"
             )
 
         if command == "overlay_cancel":
@@ -707,6 +751,8 @@ class LineMVPService:
             session.image_queue = []
             session.seen_image_event_ids = []
             session.pending_outputs = []
+            session.batch_requested = False
+            session.batch_processing = False
             session.completed_count = 0
             session.output_path = ""
             session.last_error = ""
@@ -727,6 +773,8 @@ class LineMVPService:
             session.image_queue = []
             session.seen_image_event_ids = []
             session.pending_outputs = []
+            session.batch_requested = False
+            session.batch_processing = False
             session.completed_count = 0
             session.output_path = ""
             session.last_error = ""
@@ -768,12 +816,34 @@ class LineMVPService:
                 "請稍後再次輸入「補送圖片」，不需要重新傳文字或照片。"
             )
 
+        if command == "overlay_process":
+            if not session.active:
+                return "目前不是圖片加字模式。請先選擇「圖片加字」。"
+            pair_count = min(len(session.text_queue), len(session.image_queue))
+            if pair_count <= 0:
+                return (
+                    "目前沒有可合成的完整配對。\n"
+                    f"等待文字：{len(session.text_queue)} 段；已收照片：{len(session.image_queue)} 張。\n"
+                    "請先傳文字，再傳照片。"
+                )
+            session.batch_requested = True
+            session.updated_at = self._now_iso()
+            self.overlay_store.update(session)
+            self._start_overlay_batch_job(sender_id)
+            return (
+                f"已開始安全批次合成：目前可處理 {pair_count} 組。\n"
+                "系統會依 LINE 傳送時間排序，逐組回傳圖片；不會等待新照片或無限重試。\n"
+                "可隨時輸入「加字狀態」查看進度。"
+            )
+
         mode = "加字模式" if session.active else "行程模式"
         lines = [
             f"目前模式：{mode}",
             f"等待照片的文字：{len(session.text_queue)} 段",
+            f"已收到待合成照片：{len(session.image_queue)} 張",
             f"已完成圖片：{session.completed_count} 張",
             f"等待 LINE 補送：{len(session.pending_outputs)} 張",
+            f"批次狀態：{'處理中' if session.batch_processing else '等待指令或照片'}",
         ]
         if session.last_error:
             lines.append(f"最後錯誤：{session.last_error}")
@@ -789,8 +859,13 @@ class LineMVPService:
 
     @staticmethod
     def _clean_legacy_overlay_state(session: OverlaySession) -> tuple[int, int]:
-        cleared_images = len(session.image_queue)
-        session.image_queue = []
+        cleared_images = 0
+        if session.queue_version < 2:
+            cleared_images = len(session.image_queue)
+            session.image_queue = []
+            session.batch_requested = False
+            session.batch_processing = False
+        session.queue_version = 2
 
         valid_outputs: list[str] = []
         missing_outputs = 0
@@ -1017,6 +1092,8 @@ class LineMVPService:
             return self._sender_locks.setdefault(sender_id, threading.RLock())
 
     def _prune_overlay_texts(self, session: OverlaySession) -> int:
+        if self.overlay_pair_seconds <= 0:
+            return 0
         now = datetime.now()
         valid: list[dict[str, str]] = []
         expired = 0
@@ -1063,19 +1140,20 @@ class LineMVPService:
         self._sort_overlay_image_queue(session)
         session.updated_at = self._now_iso()
         session.last_error = ""
-        self.overlay_store.update(session)
-
         received = len(session.image_queue)
-        self._start_overlay_batch_job(sender_id)
+        session.queue_version = 2
+        auto_started = received >= expected
+        session.batch_requested = auto_started
+        self.overlay_store.update(session)
         if received >= expected:
+            self._start_overlay_batch_job(sender_id)
             return (
                 f"照片已收齊：目前佇列 {received} 張、待配文字 {expected} 段。\n"
-                "數量相同，系統會依 LINE 傳送時間排序後立即在背景處理。"
+                "數量相同，系統會依 LINE 傳送時間排序後開始安全批次合成。"
             )
         return (
             f"照片已收到：目前佇列 {received} 張、待配文字 {expected} 段。\n"
-            f"系統會短暫等待約 {self.overlay_image_settle_seconds:g} 秒，依 LINE 傳送時間排序後"
-            "立即在背景處理目前已有照片，不必等全部照片傳完。"
+            "可繼續傳照片，或輸入「開始合成」先處理目前可配對的內容。"
         )
 
     def _start_overlay_batch_job(self, sender_id: str) -> None:
@@ -1084,10 +1162,17 @@ class LineMVPService:
                 return
             self._active_overlay_jobs.add(sender_id)
 
+        session = self.overlay_store.get(sender_id)
+        if session:
+            session.batch_requested = True
+            session.batch_processing = True
+            session.updated_at = self._now_iso()
+            self.overlay_store.update(session)
+
         worker = threading.Thread(
             target=self._run_overlay_batch_job,
             args=(sender_id,),
-            daemon=False,
+            daemon=True,
             name=f"line-overlay-{sha256(sender_id.encode('utf-8')).hexdigest()[:8]}",
         )
         worker.start()
@@ -1095,32 +1180,15 @@ class LineMVPService:
     def _run_overlay_batch_job(self, sender_id: str) -> None:
         final_reply = ""
         failed = False
+        processed = 0
+        has_more_pairs = False
+        should_notify = False
         try:
-            previous_signature: tuple[tuple[str, str, str], ...] | None = None
-            while True:
-                session = self.overlay_store.get(sender_id)
-                if not session or not session.active or not session.image_queue:
-                    return
-                if len(session.image_queue) >= len(session.text_queue):
-                    break
-                signature = tuple(
-                    (
-                        str(part.get("event_timestamp", "")),
-                        str(part.get("message_id", "")),
-                        str(part.get("path", "")),
-                    )
-                    for part in session.image_queue
-                )
-                if signature == previous_signature:
-                    break
-                previous_signature = signature
-                time.sleep(self.overlay_image_settle_seconds)
-
-            while True:
+            while processed < 100:
                 with self._sender_lock(sender_id):
                     session = self.overlay_store.get(sender_id)
                     if not session or not session.active:
-                        return
+                        break
                     if not session.text_queue or not session.image_queue:
                         break
 
@@ -1128,48 +1196,86 @@ class LineMVPService:
                     self._sort_overlay_image_queue(session)
                     image_part = session.image_queue.pop(0)
                     self.overlay_store.update(session)
-                    result = self._create_overlay_from_image(
-                        sender_id,
-                        session,
-                        Path(image_part["path"]),
-                    )
+                    try:
+                        result = self._create_overlay_from_image(
+                            sender_id,
+                            session,
+                            Path(image_part["path"]),
+                        )
+                    except Exception:
+                        session.image_queue.insert(0, image_part)
+                        self._sort_overlay_image_queue(session)
+                        session.batch_requested = False
+                        session.batch_processing = False
+                        self.overlay_store.update(session)
+                        raise
                     if "圖片文字合成失敗" in result:
                         failed = True
                         session.image_queue.insert(0, image_part)
                         self._sort_overlay_image_queue(session)
+                        session.batch_requested = False
+                        session.batch_processing = False
                         self.overlay_store.update(session)
-                        self._push_text_message(
-                            sender_id,
-                            result + "\n照片與文字都已保留原位，可輸入「繼續貼字」重新嘗試。",
+                        final_reply = (
+                            result
+                            + "\n照片與文字都已保留原位。修正問題後輸入「開始合成」即可重試。"
                         )
-                        return
+                        break
                     final_reply = result.removeprefix(self.OVERLAY_COMPLETE_SENTINEL)
+                    processed += 1
 
-            session = self.overlay_store.get(sender_id)
-            if not session or not session.active or not final_reply:
-                return
-            if not session.text_queue and not session.image_queue:
-                self._push_line_overlay_choice(sender_id, final_reply)
-            else:
-                self._push_text_message(sender_id, final_reply)
+            with self._sender_lock(sender_id):
+                session = self.overlay_store.get(sender_id)
+                if session:
+                    has_more_pairs = bool(session.active and session.text_queue and session.image_queue)
+                    should_notify = session.active
+                    session.batch_requested = has_more_pairs and not failed
+                    session.batch_processing = False
+                    session.updated_at = self._now_iso()
+                    self.overlay_store.update(session)
+
+            if final_reply:
+                summary = (
+                    f"{final_reply}\n"
+                    f"本輪安全批次完成：{processed} 組。"
+                    if not failed
+                    else final_reply
+                )
+                if has_more_pairs:
+                    self._push_text_message(
+                        sender_id,
+                        f"已完成 {processed} 組，剩餘配對會立即接續處理。\n"
+                        "全部完成後才會顯示模式選項。",
+                    )
+                elif should_notify:
+                    self._push_line_overlay_choice(sender_id, summary)
         except Exception as exc:
             failed = True
-            session = self.overlay_store.get(sender_id)
-            if session:
-                session.last_error = f"背景圖片批次失敗：{exc}"
-                session.updated_at = self._now_iso()
-                self.overlay_store.update(session)
+            with self._sender_lock(sender_id):
+                session = self.overlay_store.get(sender_id)
+                if session:
+                    session.batch_requested = False
+                    session.batch_processing = False
+                    session.last_error = f"圖片批次失敗：{exc}"
+                    session.updated_at = self._now_iso()
+                    self.overlay_store.update(session)
             self._push_text_message(
                 sender_id,
-                f"圖片批次處理暫時失敗：{exc}\n資料已保留，請輸入「繼續貼字」重試。",
+                f"圖片批次處理失敗：{exc}\n資料已保留，請輸入「開始合成」重試。",
             )
         finally:
             with self._overlay_job_lock:
                 self._active_overlay_jobs.discard(sender_id)
-            if not failed:
-                session = self.overlay_store.get(sender_id)
-                if session and session.active and session.text_queue and session.image_queue:
-                    self._start_overlay_batch_job(sender_id)
+            session = self.overlay_store.get(sender_id)
+            if (
+                not failed
+                and session
+                and session.batch_requested
+                and session.active
+                and session.text_queue
+                and session.image_queue
+            ):
+                self._start_overlay_batch_job(sender_id)
 
     def _create_overlay_from_image(
         self,
@@ -1238,68 +1344,6 @@ class LineMVPService:
         else:
             lines.append("可直接傳下一張照片，或選擇回到行程模式。")
         return self.OVERLAY_COMPLETE_SENTINEL + "\n".join(lines)
-
-    def _start_overlay_output_retry_job(self, sender_id: str) -> None:
-        with self._overlay_retry_lock:
-            if sender_id in self._active_overlay_retry_jobs:
-                return
-            self._active_overlay_retry_jobs.add(sender_id)
-
-        worker = threading.Thread(
-            target=self._run_overlay_output_retry_job,
-            args=(sender_id,),
-            daemon=False,
-            name=f"line-overlay-retry-{sha256(sender_id.encode('utf-8')).hexdigest()[:8]}",
-        )
-        worker.start()
-
-    def _run_overlay_output_retry_job(self, sender_id: str) -> None:
-        failed_attempts = 0
-        try:
-            while failed_attempts < self.overlay_retry_attempts:
-                session = self.overlay_store.get(sender_id)
-                if not session or not session.pending_outputs:
-                    return
-
-                delay = min(60, self.overlay_retry_delay * (2**failed_attempts))
-                time.sleep(delay)
-                with self._sender_lock(sender_id):
-                    session = self.overlay_store.get(sender_id)
-                    if not session or not session.pending_outputs:
-                        return
-                    delivered = self._retry_overlay_outputs(sender_id, session, limit=1)
-                    if delivered:
-                        failed_attempts = 0
-                        session.last_error = ""
-                    else:
-                        failed_attempts += 1
-                        session.last_error = (
-                            f"LINE 圖片補送第 {failed_attempts} 次失敗，系統仍會自動重試"
-                        )
-                    session.updated_at = self._now_iso()
-                    self.overlay_store.update(session)
-        finally:
-            with self._overlay_retry_lock:
-                self._active_overlay_retry_jobs.discard(sender_id)
-
-    def _retry_overlay_outputs(
-        self,
-        sender_id: str,
-        session: OverlaySession,
-        limit: int | None = None,
-    ) -> int:
-        delivered = 0
-        still_pending: list[str] = []
-        pending = list(session.pending_outputs)
-        candidates = pending if limit is None else pending[:limit]
-        still_pending.extend(pending[len(candidates) :])
-        for output_path in candidates:
-            if self._push_image_message(sender_id, output_path):
-                delivered += 1
-            else:
-                still_pending.append(output_path)
-        session.pending_outputs = still_pending
-        return delivered
 
     @staticmethod
     def _line_event_sort_key(part: dict[str, str]) -> tuple[int, int, int | str]:
@@ -1561,11 +1605,15 @@ class LineMVPService:
             "3. 略過 案件代碼\n"
             "4. 套用 案件代碼\n"
             "5. 加字模式：進入獨立圖片加字功能\n"
-            "6. 加字狀態：查看待配對數量\n"
-            "7. 結束加字：返回行程模式\n"
-            "8. 取消加字：清空本批未配對文字\n"
+            "6. 開始合成：先處理目前已成對的文字與照片\n"
+            "7. 加字狀態：查看文字、照片、完成及待補送數量\n"
+            "8. 補送圖片：手動補送一張已完成圖片\n"
+            "9. 結束加字：返回行程模式並清空本批紀錄\n"
+            "10. 取消加字：清空本批紀錄\n"
             "也可以直接傳新的行程文字、圖片、PDF、Word 模板給我。\n"
-            "圖片加字必須先傳完文字，再傳照片；第 1 段配第 1 張，依序一對一回傳。"
+            "圖片加字必須先傳完文字，再傳照片；文字與照片各自依 LINE 傳送時間排序，"
+            "第 1 段配第 1 張，依序一對一回傳。數量相同時會自動開始，"
+            "整批完成後可選擇繼續或回到行程模式。"
         )
 
     def _retry_delay_seconds(self, attempt: int) -> int:
