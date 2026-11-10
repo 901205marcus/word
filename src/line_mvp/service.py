@@ -108,6 +108,18 @@ class LineMVPService:
             source_type = source.get("type", "unknown")
             message_type = message.get("type", "")
             raw_text = message.get("text", "").strip() if message_type == "text" else ""
+            reply_token = event.get("replyToken", "")
+
+            if message_type == "text" and reply_token:
+                command, _code = self._parse_line_command(raw_text)
+                if command == "overlay_retry":
+                    handled, success = self._reply_pending_overlay_images(
+                        sender_id,
+                        reply_token,
+                    )
+                    if handled and success:
+                        replies.append({"sender_id": sender_id, "ok": "true"})
+                        continue
 
             reply_text = self._handle_line_event(
                 sender_id,
@@ -117,7 +129,6 @@ class LineMVPService:
                 event_id=str(event.get("webhookEventId", "")),
             )
             if reply_text:
-                reply_token = event.get("replyToken", "")
                 success = False
                 if reply_text == self.FUNCTION_MENU_SENTINEL:
                     if reply_token:
@@ -1060,6 +1071,72 @@ class LineMVPService:
             },
         )
         return self._send_line_request(req, timeout=10, retries=2)
+
+    def _reply_pending_overlay_images(
+        self,
+        sender_id: str,
+        reply_token: str,
+    ) -> tuple[bool, bool]:
+        token = os.getenv("LINE_CHANNEL_ACCESS_TOKEN", "").strip()
+        if not token or not sender_id or not reply_token:
+            return False, False
+
+        with self._sender_lock(sender_id):
+            session = self.overlay_store.get(sender_id)
+            if not session:
+                return False, False
+            self._clean_legacy_overlay_state(session)
+            output_paths = list(session.pending_outputs[:5])
+            self.overlay_store.update(session)
+
+        if not output_paths:
+            return False, False
+
+        base_url = self.public_base_url()
+        messages: list[dict[str, str]] = []
+        for output_path in output_paths:
+            image_url = self._public_output_url(output_path, base_url)
+            source_path = Path(output_path)
+            preview_path = source_path.with_name(
+                f"{source_path.stem}_line_preview.jpg"
+            )
+            try:
+                self.image_text_composer.create_preview(source_path, preview_path)
+            except Exception as exc:
+                self._set_line_request_error(f"建立 LINE 預覽圖失敗：{exc}")
+                return True, False
+            preview_url = self._public_output_url(str(preview_path), base_url)
+            if not image_url or not preview_url:
+                self._set_line_request_error("無法建立待補送圖片的公開網址")
+                return True, False
+            messages.append(
+                {
+                    "type": "image",
+                    "originalContentUrl": image_url,
+                    "previewImageUrl": preview_url,
+                }
+            )
+
+        req = self._make_line_request(
+            "https://api.line.me/v2/bot/message/reply",
+            token,
+            {"replyToken": reply_token, "messages": messages},
+        )
+        success = self._send_line_request(req, timeout=15, retries=1)
+        if not success:
+            return True, False
+
+        with self._sender_lock(sender_id):
+            session = self.overlay_store.get(sender_id)
+            if session:
+                delivered = set(output_paths)
+                session.pending_outputs = [
+                    path for path in session.pending_outputs if path not in delivered
+                ]
+                session.last_error = ""
+                session.updated_at = self._now_iso()
+                self.overlay_store.update(session)
+        return True, True
 
     def _push_line_function_menu(self, to: str) -> bool:
         token = os.getenv("LINE_CHANNEL_ACCESS_TOKEN", "").strip()

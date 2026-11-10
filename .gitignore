@@ -6,6 +6,7 @@ __pycache__/
 *.log
 .env
 outputs/
+recovered_line_outputs/
 data/
 !data/.gitkeep
 !data/line_mvp/.gitkeep

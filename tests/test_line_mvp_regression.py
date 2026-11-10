@@ -820,6 +820,60 @@ class ServiceRegressionTests(unittest.TestCase):
         updated = self.service.overlay_store.get("manual-retry-user")
         self.assertEqual([str(second)], updated.pending_outputs)
 
+    def test_webhook_retry_replies_with_five_images_without_push_quota(self) -> None:
+        sender_id = "reply-image-user"
+        self.service._handle_line_text(sender_id, "user", "加字模式")
+        session = self.service.overlay_store.get(sender_id)
+        outputs = []
+        for index in range(6):
+            output = self.service.output_dir / f"reply-{index}.jpg"
+            Image.new("RGB", (800, 600), (index * 20, 80, 120)).save(output)
+            outputs.append(str(output))
+        session.pending_outputs = outputs
+        self.service.overlay_store.update(session)
+        payload = {
+            "events": [
+                {
+                    "type": "message",
+                    "replyToken": "free-reply-token",
+                    "timestamp": 1000,
+                    "webhookEventId": "retry-event",
+                    "source": {"type": "user", "userId": sender_id},
+                    "message": {
+                        "type": "text",
+                        "id": "retry-message",
+                        "text": "補送圖片",
+                    },
+                }
+            ]
+        }
+
+        with patch.dict(
+            os.environ,
+            {
+                "LINE_CHANNEL_ACCESS_TOKEN": "test-token",
+                "PUBLIC_BASE_URL": "https://word.example.com",
+            },
+        ), patch.object(
+            self.service,
+            "_send_line_request",
+            return_value=True,
+        ) as send_mock:
+            result = self.service.ingest_webhook(payload)
+
+        self.assertEqual([{"sender_id": sender_id, "ok": "true"}], result["replies"])
+        send_mock.assert_called_once()
+        request_obj = send_mock.call_args.args[0]
+        self.assertEqual(
+            "https://api.line.me/v2/bot/message/reply",
+            request_obj.full_url,
+        )
+        request_payload = json.loads(request_obj.data.decode("utf-8"))
+        self.assertEqual("free-reply-token", request_payload["replyToken"])
+        self.assertEqual(5, len(request_payload["messages"]))
+        updated = self.service.overlay_store.get(sender_id)
+        self.assertEqual([outputs[-1]], updated.pending_outputs)
+
     def test_overlay_retry_accepts_photo_word_and_removes_misqueued_command(self) -> None:
         sender_id = "photo-word-retry-user"
         self.service._handle_line_text(sender_id, "user", "加字模式")
