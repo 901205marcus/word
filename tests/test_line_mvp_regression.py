@@ -269,9 +269,86 @@ class ServiceRegressionTests(unittest.TestCase):
 
         self.assertIn("第 1 組完成", reply)
         session = self.service.overlay_store.get("user-1")
+        self.assertTrue(session.active)
         self.assertTrue(Path(session.output_path).exists())
         self.assertEqual([], session.text_queue)
         self.assertIsNone(self.service.store.find_message("user-1"))
+
+    def test_overlay_completion_replies_with_continue_or_schedule_choices(self) -> None:
+        self.service._handle_line_text("choice-user", "user", "加字模式")
+        self.service._handle_line_text("choice-user", "user", "红花")
+        source = self.tempdir / "choice-source.jpg"
+        Image.new("RGB", (900, 600), (40, 90, 160)).save(source, format="JPEG")
+
+        with patch.object(
+            self.service,
+            "_download_line_message_content",
+            return_value=(source.read_bytes(), "image/jpeg"),
+        ), patch.object(
+            self.service,
+            "_push_image_message",
+            return_value=True,
+        ), patch.object(
+            self.service,
+            "_reply_line_overlay_choice",
+            return_value=True,
+        ) as choice_mock:
+            result = self.service.ingest_webhook(
+                {
+                    "events": [
+                        {
+                            "type": "message",
+                            "replyToken": "choice-token",
+                            "timestamp": 3_000,
+                            "webhookEventId": "image-event",
+                            "source": {"userId": "choice-user", "type": "user"},
+                            "message": {"id": "image-1", "type": "image"},
+                        }
+                    ]
+                }
+            )
+
+        self.assertEqual("true", result["replies"][0]["ok"])
+        choice_mock.assert_called_once()
+        reply_token, choice_text = choice_mock.call_args.args
+        self.assertEqual("choice-token", reply_token)
+        self.assertIn("第 1 組完成", choice_text)
+        session = self.service.overlay_store.get("choice-user")
+        self.assertTrue(session.active)
+
+        message = self.service._overlay_choice_message(choice_text)
+        actions = [item["action"] for item in message["quickReply"]["items"]]
+        self.assertEqual(["繼續貼字", "回到行程模式"], [action["label"] for action in actions])
+        self.assertEqual(["繼續貼字", "回到行程模式"], [action["text"] for action in actions])
+
+    def test_schedule_mode_choice_resets_all_overlay_records(self) -> None:
+        self.service._handle_line_text("reset-user", "user", "加字模式")
+        self.service._handle_line_text(
+            "reset-user",
+            "user",
+            "尚未配對",
+            event_timestamp=1_000,
+            message_id="101",
+            event_id="event-1",
+        )
+        session = self.service.overlay_store.get("reset-user")
+        session.completed_count = 4
+        session.pending_outputs = ["one.jpg", "two.jpg"]
+        session.output_path = "latest.jpg"
+        session.last_error = "previous error"
+        self.service.overlay_store.update(session)
+
+        reply = self.service._handle_line_text("reset-user", "user", "回到行程模式")
+
+        self.assertIn("本批貼字紀錄已歸零", reply)
+        reset = self.service.overlay_store.get("reset-user")
+        self.assertFalse(reset.active)
+        self.assertEqual([], reset.text_queue)
+        self.assertEqual([], reset.seen_event_ids)
+        self.assertEqual([], reset.pending_outputs)
+        self.assertEqual(0, reset.completed_count)
+        self.assertEqual("", reset.output_path)
+        self.assertEqual("", reset.last_error)
 
     def test_overlay_texts_follow_line_timestamp_instead_of_arrival_order(self) -> None:
         composed: list[str] = []

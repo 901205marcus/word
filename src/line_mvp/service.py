@@ -29,8 +29,10 @@ from .word_editor import ScheduleWordEditor
 class LineMVPService:
     APPLYING_MARKER = "[APPLYING]"
     FUNCTION_MENU_SENTINEL = "__LINE_FUNCTION_MENU__"
+    OVERLAY_COMPLETE_SENTINEL = "__LINE_OVERLAY_COMPLETE__\n"
     OVERLAY_COMMANDS = {
         "overlay_start",
+        "overlay_continue",
         "overlay_end",
         "overlay_cancel",
         "overlay_status",
@@ -114,6 +116,12 @@ class LineMVPService:
                         success = self._reply_line_function_menu(reply_token)
                     if not success:
                         success = self._push_line_function_menu(sender_id)
+                elif reply_text.startswith(self.OVERLAY_COMPLETE_SENTINEL):
+                    choice_text = reply_text.removeprefix(self.OVERLAY_COMPLETE_SENTINEL)
+                    if reply_token:
+                        success = self._reply_line_overlay_choice(reply_token, choice_text)
+                    if not success:
+                        success = self._push_line_overlay_choice(sender_id, choice_text)
                 else:
                     if reply_token:
                         success = self._reply_line_message(reply_token, reply_text)
@@ -454,8 +462,11 @@ class LineMVPService:
             "開始加字": "overlay_start",
             "圖片加字": "overlay_start",
             "圖片加字模式": "overlay_start",
+            "繼續貼字": "overlay_continue",
+            "繼續加字": "overlay_continue",
             "/結束加字": "overlay_end",
             "結束加字": "overlay_end",
+            "回到行程模式": "schedule_mode",
             "/取消加字": "overlay_cancel",
             "取消加字": "overlay_cancel",
             "/加字狀態": "overlay_status",
@@ -569,6 +580,17 @@ class LineMVPService:
                 f"目前等待文字：{len(session.text_queue)} 段。完成後輸入「結束加字」。"
             )
 
+        if command == "overlay_continue":
+            session.active = True
+            session.updated_at = self._now_iso()
+            session.last_error = ""
+            self.overlay_store.update(session)
+            return (
+                "已繼續貼字模式，本批紀錄保留。\n"
+                f"目前尚待照片：{len(session.text_queue)} 段文字。\n"
+                "可繼續傳文字或照片；完成後仍會再次顯示模式選項。"
+            )
+
         if command == "overlay_cancel":
             cleared = len(session.text_queue)
             session.active = False
@@ -579,16 +601,24 @@ class LineMVPService:
             return f"已取消圖片加字並清空 {cleared} 段未配對文字，現在恢復行程模式。"
 
         if command in {"overlay_end", "schedule_mode"}:
+            waiting = len(session.text_queue)
+            completed = session.completed_count
+            pending = len(session.pending_outputs)
             session.active = False
+            session.text_queue = []
+            session.seen_event_ids = []
+            session.pending_outputs = []
+            session.completed_count = 0
+            session.output_path = ""
+            session.last_error = ""
             session.updated_at = self._now_iso()
             self.overlay_store.update(session)
-            waiting = len(session.text_queue)
-            suffix = (
-                f"尚有 {waiting} 段文字未配照片；再次輸入「加字模式」可繼續。"
-                if waiting
-                else "本批次已完成。"
+            return (
+                "已切換至行程模式。\n"
+                f"本批貼字紀錄已歸零：完成 {completed} 張、未配文字 {waiting} 段、"
+                f"待補送 {pending} 張。\n"
+                "現在傳送的文字、圖片與 Word 會交給行程功能。"
             )
-            return f"已切換至行程模式。\n{suffix}\n現在傳送的文字、圖片與 Word 會交給行程功能。"
 
         delivered = self._retry_overlay_outputs(sender_id, session)
         self.overlay_store.update(session)
@@ -709,6 +739,20 @@ class LineMVPService:
         )
         return self._send_line_request(req, timeout=10, retries=2)
 
+    def _reply_line_overlay_choice(self, reply_token: str, text: str) -> bool:
+        token = os.getenv("LINE_CHANNEL_ACCESS_TOKEN", "").strip()
+        if not token or not reply_token or not text:
+            return False
+        req = self._make_line_request(
+            "https://api.line.me/v2/bot/message/reply",
+            token,
+            {
+                "replyToken": reply_token,
+                "messages": [self._overlay_choice_message(text)],
+            },
+        )
+        return self._send_line_request(req, timeout=10, retries=2)
+
     def _push_line_function_menu(self, to: str) -> bool:
         token = os.getenv("LINE_CHANNEL_ACCESS_TOKEN", "").strip()
         if not token or not to:
@@ -717,6 +761,17 @@ class LineMVPService:
             "https://api.line.me/v2/bot/message/push",
             token,
             {"to": to, "messages": [self._function_menu_message()]},
+        )
+        return self._send_line_request(req, timeout=15, retries=self.line_push_retries)
+
+    def _push_line_overlay_choice(self, to: str, text: str) -> bool:
+        token = os.getenv("LINE_CHANNEL_ACCESS_TOKEN", "").strip()
+        if not token or not to or not text:
+            return False
+        req = self._make_line_request(
+            "https://api.line.me/v2/bot/message/push",
+            token,
+            {"to": to, "messages": [self._overlay_choice_message(text)]},
         )
         return self._send_line_request(req, timeout=15, retries=self.line_push_retries)
 
@@ -735,6 +790,33 @@ class LineMVPService:
                     {"type": "message", "label": "加字狀態", "text": "加字狀態"},
                     {"type": "message", "label": "使用說明", "text": "幫助"},
                 ],
+            },
+        }
+
+    @staticmethod
+    def _overlay_choice_message(text: str) -> dict[str, Any]:
+        return {
+            "type": "text",
+            "text": text[:5000],
+            "quickReply": {
+                "items": [
+                    {
+                        "type": "action",
+                        "action": {
+                            "type": "message",
+                            "label": "繼續貼字",
+                            "text": "繼續貼字",
+                        },
+                    },
+                    {
+                        "type": "action",
+                        "action": {
+                            "type": "message",
+                            "label": "回到行程模式",
+                            "text": "回到行程模式",
+                        },
+                    },
+                ]
             },
         }
 
@@ -830,8 +912,10 @@ class LineMVPService:
         if expired:
             lines.append(f"已清除逾時文字：{expired} 段。")
         if not session.text_queue:
-            lines.append("本批文字已全部配完，可輸入「結束加字」回到行程模式。")
-        return "\n".join(lines)
+            lines.append("本批文字已全部配完，請選擇繼續貼字或回到行程模式。")
+        else:
+            lines.append("可直接傳下一張照片，或選擇回到行程模式。")
+        return self.OVERLAY_COMPLETE_SENTINEL + "\n".join(lines)
 
     def _retry_overlay_outputs(self, sender_id: str, session: OverlaySession) -> int:
         delivered = 0
