@@ -99,7 +99,13 @@ class LineMVPService:
             message_type = message.get("type", "")
             raw_text = message.get("text", "").strip() if message_type == "text" else ""
 
-            reply_text = self._handle_line_event(sender_id, source_type, message)
+            reply_text = self._handle_line_event(
+                sender_id,
+                source_type,
+                message,
+                event_timestamp=event.get("timestamp"),
+                event_id=str(event.get("webhookEventId", "")),
+            )
             if reply_text:
                 reply_token = event.get("replyToken", "")
                 success = False
@@ -219,22 +225,59 @@ class LineMVPService:
             recovered += 1
         return recovered
 
-    def _handle_line_event(self, sender_id: str, source_type: str, message: dict[str, Any]) -> str:
+    def _handle_line_event(
+        self,
+        sender_id: str,
+        source_type: str,
+        message: dict[str, Any],
+        event_timestamp: int | None = None,
+        event_id: str = "",
+    ) -> str:
         message_type = message.get("type", "")
         if message_type == "text":
             raw_text = message.get("text", "").strip()
             if not raw_text:
                 return ""
-            return self._handle_line_text(sender_id, source_type, raw_text)
+            return self._handle_line_text(
+                sender_id,
+                source_type,
+                raw_text,
+                event_timestamp=event_timestamp,
+                message_id=str(message.get("id", "")),
+                event_id=event_id,
+            )
         if message_type in {"file", "image"}:
             return self._handle_line_attachment(sender_id, source_type, message)
         return "目前只支援文字、圖片與檔案訊息。"
 
-    def _handle_line_text(self, sender_id: str, source_type: str, raw_text: str) -> str:
+    def _handle_line_text(
+        self,
+        sender_id: str,
+        source_type: str,
+        raw_text: str,
+        event_timestamp: int | None = None,
+        message_id: str = "",
+        event_id: str = "",
+    ) -> str:
         with self._sender_lock(sender_id):
-            return self._handle_line_text_locked(sender_id, source_type, raw_text)
+            return self._handle_line_text_locked(
+                sender_id,
+                source_type,
+                raw_text,
+                event_timestamp=event_timestamp,
+                message_id=message_id,
+                event_id=event_id,
+            )
 
-    def _handle_line_text_locked(self, sender_id: str, source_type: str, raw_text: str) -> str:
+    def _handle_line_text_locked(
+        self,
+        sender_id: str,
+        source_type: str,
+        raw_text: str,
+        event_timestamp: int | None = None,
+        message_id: str = "",
+        event_id: str = "",
+    ) -> str:
         command, code = self._parse_line_command(raw_text)
         if command in self.OVERLAY_COMMANDS or command == "menu":
             return self._execute_line_command(sender_id, command, code)
@@ -242,12 +285,28 @@ class LineMVPService:
         overlay_session = self.overlay_store.get(sender_id)
         if overlay_session and overlay_session.active:
             self._prune_overlay_texts(overlay_session)
-            overlay_session.text_queue.append({"text": raw_text, "at": self._now_iso()})
+            if event_id and event_id in overlay_session.seen_event_ids:
+                return "這段加字文字已經收到，不會重複加入配對佇列。"
+            overlay_session.text_queue.append(
+                {
+                    "text": raw_text,
+                    "at": self._now_iso(),
+                    "event_timestamp": str(event_timestamp or ""),
+                    "message_id": message_id,
+                    "event_id": event_id,
+                }
+            )
+            if event_id:
+                overlay_session.seen_event_ids.append(event_id)
+                overlay_session.seen_event_ids = overlay_session.seen_event_ids[-500:]
+            self._sort_overlay_text_queue(overlay_session)
             overlay_session.updated_at = self._now_iso()
             overlay_session.last_error = ""
             self.overlay_store.update(overlay_session)
             return (
-                f"加字文字已加入：第 {len(overlay_session.text_queue)} 段待配對。\n"
+                f"加字文字已加入：第 {len(overlay_session.text_queue)} 段待配對，"
+                f"目前共 {len(overlay_session.text_queue)} 段。\n"
+                "系統會依 LINE 實際傳送時間排序，不使用 webhook 到達順序。\n"
                 "可以繼續傳文字；全部文字傳完後，再按照相同順序傳送照片。\n"
                 "這段文字不會加入行程。"
             )
@@ -724,6 +783,7 @@ class LineMVPService:
             self.overlay_store.update(session)
             return "等待配對的文字已逾時，請重新傳送文字後再傳照片。"
 
+        self._sort_overlay_text_queue(session)
         delivered = self._retry_overlay_outputs(sender_id, session)
         text_part = session.text_queue.pop(0)
         pair_number = session.completed_count + 1
@@ -783,6 +843,25 @@ class LineMVPService:
                 still_pending.append(output_path)
         session.pending_outputs = still_pending
         return delivered
+
+    @staticmethod
+    def _sort_overlay_text_queue(session: OverlaySession) -> None:
+        def sort_key(part: dict[str, str]) -> tuple[int, int, int | str]:
+            timestamp_text = str(part.get("event_timestamp", "")).strip()
+            try:
+                timestamp = int(timestamp_text)
+            except ValueError:
+                try:
+                    timestamp = int(datetime.fromisoformat(part.get("at", "")).timestamp() * 1000)
+                except (TypeError, ValueError):
+                    timestamp = 0
+
+            message_id = str(part.get("message_id", "")).strip()
+            if message_id.isdigit():
+                return timestamp, 0, int(message_id)
+            return timestamp, 1, message_id
+
+        session.text_queue.sort(key=sort_key)
 
     def _push_image_message(self, to: str, image_path: str) -> bool:
         token = os.getenv("LINE_CHANNEL_ACCESS_TOKEN", "").strip()

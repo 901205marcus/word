@@ -25,6 +25,7 @@ class OverlaySessionStore:
                 sender_id=sender_id,
                 active=bool(raw.get("active", False)),
                 text_queue=list(raw.get("text_queue", [])),
+                seen_event_ids=list(raw.get("seen_event_ids", [])),
                 pending_outputs=list(raw.get("pending_outputs", [])),
                 completed_count=int(raw.get("completed_count", 0)),
                 output_path=raw.get("output_path", ""),

@@ -273,6 +273,81 @@ class ServiceRegressionTests(unittest.TestCase):
         self.assertEqual([], session.text_queue)
         self.assertIsNone(self.service.store.find_message("user-1"))
 
+    def test_overlay_texts_follow_line_timestamp_instead_of_arrival_order(self) -> None:
+        composed: list[str] = []
+
+        def fake_compose(image_path: str, text: str, output_path: Path) -> str:
+            composed.append(text)
+            Path(output_path).write_bytes(b"generated-jpeg")
+            return str(output_path)
+
+        self.service._handle_line_text("ordered-user", "user", "加字模式")
+        self.service._handle_line_text(
+            "ordered-user",
+            "user",
+            "第二段",
+            event_timestamp=2_000,
+            message_id="102",
+            event_id="event-2",
+        )
+        self.service._handle_line_text(
+            "ordered-user",
+            "user",
+            "第一段",
+            event_timestamp=1_000,
+            message_id="101",
+            event_id="event-1",
+        )
+
+        session = self.service.overlay_store.get("ordered-user")
+        self.assertEqual(["第一段", "第二段"], [part["text"] for part in session.text_queue])
+
+        with patch.object(
+            self.service,
+            "_download_line_message_content",
+            return_value=(b"image", "image/jpeg"),
+        ), patch.object(
+            self.service.image_text_composer,
+            "compose",
+            side_effect=fake_compose,
+        ), patch.object(self.service, "_push_image_message", return_value=True):
+            self.service._handle_line_attachment(
+                "ordered-user",
+                "user",
+                {"id": "image-1", "type": "image"},
+            )
+            self.service._handle_line_attachment(
+                "ordered-user",
+                "user",
+                {"id": "image-2", "type": "image"},
+            )
+
+        self.assertEqual(["第一段", "第二段"], composed)
+
+    def test_overlay_redelivery_does_not_duplicate_text(self) -> None:
+        self.service._handle_line_text("duplicate-user", "user", "加字模式")
+        first = self.service._handle_line_text(
+            "duplicate-user",
+            "user",
+            "红花",
+            event_timestamp=1_000,
+            message_id="101",
+            event_id="same-event",
+        )
+        duplicate = self.service._handle_line_text(
+            "duplicate-user",
+            "user",
+            "红花",
+            event_timestamp=1_000,
+            message_id="101",
+            event_id="same-event",
+        )
+
+        self.assertIn("目前共 1 段", first)
+        self.assertIn("不會重複加入", duplicate)
+        session = self.service.overlay_store.get("duplicate-user")
+        self.assertEqual(1, len(session.text_queue))
+
     def test_overlay_mode_rejects_image_before_text(self) -> None:
         self.service._handle_line_text("user-2", "user", "加字模式")
         source = self.tempdir / "source-first.jpg"
@@ -433,6 +508,7 @@ class ImageTextComposerTests(unittest.TestCase):
         font = ImageTextComposer._load_font(72, "红花")
         self.assertTrue(ImageTextComposer._font_supports_text(font, "红花"))
         self.assertEqual("NotoSansSC.ttf", Path(font.path).name)
+        self.assertTrue(ImageTextComposer._font_supports_text(font, "紅红花"))
 
         source = self.tempdir / "simplified-source.jpg"
         output = self.tempdir / "simplified-result.jpg"
