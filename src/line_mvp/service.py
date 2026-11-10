@@ -842,14 +842,16 @@ class LineMVPService:
                     "系統沒有啟動背景重試；如仍有圖片，請再次輸入「補送照片」。"
                 )
 
+            error_detail = self._last_line_request_error()
             session.last_error = "手動補送失敗；成品仍安全保留"
+            if error_detail:
+                session.last_error += f"；{error_detail}"
             session.updated_at = self._now_iso()
             self.overlay_store.update(session)
             download_url = self._public_output_url(
                 output_path,
                 self.public_base_url(),
             )
-            error_detail = self._last_line_request_error()
             fallback_lines = [
                 "圖片訊息補送失敗，但成品沒有遺失。",
                 f"仍等待補送：{len(session.pending_outputs)} 張。",
@@ -907,6 +909,16 @@ class LineMVPService:
                 f"失效成品 {missing_outputs} 張"
             )
         if session.pending_outputs:
+            lines.append("等待補送的成品可直接下載：")
+            for index, output_path in enumerate(session.pending_outputs[:5], start=1):
+                output_url = self._public_output_url(
+                    output_path,
+                    self.public_base_url(),
+                )
+                if output_url:
+                    lines.append(f"{index}. {output_url}")
+            if len(session.pending_outputs) > 5:
+                lines.append(f"其餘尚有 {len(session.pending_outputs) - 5} 張。")
             lines.append("可輸入「補送圖片」單次重試，不會在背景自動重送。")
         self.overlay_store.update(session)
         return "\n".join(lines)
@@ -1376,6 +1388,9 @@ class LineMVPService:
             if result_path not in session.pending_outputs:
                 session.pending_outputs.append(result_path)
             session.last_error = f"第 {pair_number} 組已完成，等待手動補送"
+            error_detail = self._last_line_request_error()
+            if error_detail:
+                session.last_error += f"；{error_detail}"
         self.overlay_store.update(session)
 
         lines = [
@@ -1386,16 +1401,16 @@ class LineMVPService:
             lines.append("合成圖片已回傳；本組文字與照片不會再被使用。")
         else:
             lines.append("圖片已完成但 LINE 圖片訊息回傳失敗，系統已保留成品。")
-            download_url = self._public_output_url(
-                result_path,
-                self.public_base_url(),
-            )
-            if download_url:
-                lines.extend(["請先用下面連結直接下載成品：", download_url])
             error_detail = self._last_line_request_error()
             if error_detail:
                 lines.append(f"LINE 拒絕原因：{error_detail}")
             lines.append("仍可輸入「補送照片」單次重試。")
+        download_url = self._public_output_url(
+            result_path,
+            self.public_base_url(),
+        )
+        if download_url:
+            lines.extend(["原尺寸成品下載：", download_url])
         if delivered:
             lines.append(f"另外補送了先前等待中的圖片：{delivered} 張。")
         if expired:
@@ -1468,7 +1483,27 @@ class LineMVPService:
                 ],
             },
         )
-        return self._send_line_request(req, timeout=12, retries=1)
+        if self._send_line_request(req, timeout=12, retries=1):
+            return True
+
+        # LINE sometimes rejects a large original even when it is below the documented
+        # limit. Keep the full-size file for download, then retry the image bubble with
+        # the small delivery copy as both URLs.
+        fallback_req = self._make_line_request(
+            "https://api.line.me/v2/bot/message/push",
+            token,
+            {
+                "to": to,
+                "messages": [
+                    {
+                        "type": "image",
+                        "originalContentUrl": preview_url,
+                        "previewImageUrl": preview_url,
+                    }
+                ],
+            },
+        )
+        return self._send_line_request(fallback_req, timeout=12, retries=2)
 
     def _push_apply_assets(self, to: str, item: InboxMessage) -> bool:
         token = os.getenv("LINE_CHANNEL_ACCESS_TOKEN", "").strip()

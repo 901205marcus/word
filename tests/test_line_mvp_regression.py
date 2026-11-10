@@ -763,6 +763,40 @@ class ServiceRegressionTests(unittest.TestCase):
                 preview_image.width / preview_image.height,
             )
 
+    def test_line_image_push_retries_with_small_delivery_copy(self) -> None:
+        original = self.service.output_dir / "fallback-original.jpg"
+        Image.new("RGB", (1800, 1200), "orange").save(original, quality=95)
+        original_size = original.stat().st_size
+
+        with patch.dict(
+            os.environ,
+            {
+                "LINE_CHANNEL_ACCESS_TOKEN": "test-token",
+                "PUBLIC_BASE_URL": "https://word.example.com",
+            },
+        ), patch.object(
+            self.service,
+            "_send_line_request",
+            side_effect=[False, True],
+        ) as send_mock:
+            pushed = self.service._push_image_message("fallback-user", str(original))
+
+        self.assertTrue(pushed)
+        self.assertEqual(2, send_mock.call_count)
+        fallback_request = send_mock.call_args_list[1].args[0]
+        fallback_payload = json.loads(fallback_request.data.decode("utf-8"))
+        fallback_message = fallback_payload["messages"][0]
+        self.assertEqual(
+            fallback_message["originalContentUrl"],
+            fallback_message["previewImageUrl"],
+        )
+        self.assertTrue(
+            fallback_message["originalContentUrl"].endswith(
+                "/fallback-original_line_preview.jpg"
+            )
+        )
+        self.assertEqual(original_size, original.stat().st_size)
+
     def test_manual_overlay_retry_sends_one_saved_image(self) -> None:
         self.service._handle_line_text("manual-retry-user", "user", "加字模式")
         first = self.tempdir / "outputs" / "first.jpg"
@@ -849,6 +883,19 @@ class ServiceRegressionTests(unittest.TestCase):
         updated = self.service.overlay_store.get("manual-fail-user")
         self.assertEqual([str(output)], updated.pending_outputs)
         self.assertIn("成品仍安全保留", updated.last_error)
+        self.assertIn("HTTP 400", updated.last_error)
+
+        with patch.dict(
+            os.environ,
+            {"PUBLIC_BASE_URL": "https://word.example.com"},
+        ):
+            status = self.service._handle_line_text(
+                "manual-fail-user",
+                "user",
+                "加字狀態",
+            )
+        self.assertIn("等待補送的成品可直接下載", status)
+        self.assertIn("https://word.example.com/files/failed.jpg", status)
 
     def test_public_base_url_ignores_render_dashboard_url(self) -> None:
         with patch.dict(
