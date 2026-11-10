@@ -10,7 +10,6 @@ from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
-from starlette.concurrency import run_in_threadpool
 
 from .models import InboxMessage, MessageStatus
 from .service import LineMVPService
@@ -27,7 +26,6 @@ app.mount("/files", StaticFiles(directory=str(OUTPUT_DIR)), name="files")
 @app.on_event("startup")
 def startup_recover_jobs():
     service.recover_pending_jobs()
-    service.recover_overlay_jobs()
     threading.Thread(
         target=service.ensure_line_rich_menu,
         daemon=True,
@@ -82,9 +80,7 @@ async def line_webhook(request: Request):
     if not service.verify_signature(body, signature):
         raise HTTPException(status_code=401, detail="Invalid signature")
     payload = json.loads(body.decode("utf-8"))
-    # LINE downloads and image work are blocking; keep the async server free for
-    # additional webhook deliveries while those operations run in the worker pool.
-    result = await run_in_threadpool(service.ingest_webhook, payload)
+    result = service.ingest_webhook(payload)
     return JSONResponse(
         {
             "created": [message.id for message in result["created"]],

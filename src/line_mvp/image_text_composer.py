@@ -7,24 +7,8 @@ from PIL import Image, ImageDraw, ImageFont, ImageOps
 
 
 class ImageTextComposer:
-    def __init__(
-        self,
-        max_dimension: int | None = None,
-        max_output_bytes: int | None = None,
-    ):
-        configured_max = int(os.getenv("OVERLAY_MAX_DIMENSION", "0"))
-        self.max_dimension = max(0, configured_max if max_dimension is None else max_dimension)
-        self.jpeg_quality = min(
-            95,
-            max(70, int(os.getenv("OVERLAY_JPEG_QUALITY", "91"))),
-        )
-        configured_output_mb = float(os.getenv("OVERLAY_MAX_OUTPUT_MB", "9"))
-        self.max_output_bytes = max(
-            256 * 1024,
-            int(configured_output_mb * 1024 * 1024)
-            if max_output_bytes is None
-            else max_output_bytes,
-        )
+    def __init__(self, max_dimension: int = 2048):
+        self.max_dimension = max_dimension
 
     def compose(self, image_path: str | Path, text: str, output_path: str | Path) -> str:
         caption = text.strip()
@@ -39,15 +23,15 @@ class ImageTextComposer:
         output.parent.mkdir(parents=True, exist_ok=True)
 
         with Image.open(source) as opened:
-            image = ImageOps.exif_transpose(opened).convert("RGB")
+            image = ImageOps.exif_transpose(opened).convert("RGBA")
 
-        if self.max_dimension > 0:
-            image.thumbnail((self.max_dimension, self.max_dimension), Image.Resampling.LANCZOS)
+        image.thumbnail((self.max_dimension, self.max_dimension), Image.Resampling.LANCZOS)
         width, height = image.size
         if width < 120 or height < 120:
             raise ValueError("照片尺寸太小，無法清楚放上文字。")
 
-        draw = ImageDraw.Draw(image)
+        overlay = Image.new("RGBA", image.size, (0, 0, 0, 0))
+        draw = ImageDraw.Draw(overlay)
         font, lines, spacing, _text_bbox = self._fit_text(draw, caption, width, height)
 
         center_x = width / 2
@@ -58,24 +42,16 @@ class ImageTextComposer:
             (center_x, center_y),
             "\n".join(lines),
             font=font,
-            fill=(255, 255, 255),
+            fill=(255, 255, 255, 255),
             anchor="mm",
             align="center",
             spacing=spacing,
             stroke_width=stroke_width,
-            stroke_fill=(0, 0, 0),
+            stroke_fill=(0, 0, 0, 235),
         )
 
-        for quality in range(self.jpeg_quality, 69, -4):
-            image.save(
-                output,
-                format="JPEG",
-                quality=quality,
-                optimize=False,
-                progressive=True,
-            )
-            if output.stat().st_size <= self.max_output_bytes:
-                break
+        result = Image.alpha_composite(image, overlay).convert("RGB")
+        result.save(output, format="JPEG", quality=91, optimize=True, progressive=True)
         return str(output)
 
     def _fit_text(
