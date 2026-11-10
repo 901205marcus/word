@@ -151,7 +151,7 @@ https://你的服務網址/webhook/line
 - 輸入 `加字狀態` 可查看待配對數量；輸入 `結束加字` 返回行程模式
 - 輸入 `取消加字` 會清空未配對文字並返回行程模式
 - 配對時間可用 `OVERLAY_PAIR_SECONDS` 調整，預設為 `1800` 秒
-- 照片排序等待時間可用 `OVERLAY_IMAGE_SETTLE_SECONDS` 調整，預設為 `1.5` 秒
+- 照片與文字數量相同時會立即處理；尚未收齊時的排序等待可用 `OVERLAY_IMAGE_SETTLE_SECONDS` 調整，預設為 `0.6` 秒
 - 專案已內建 Noto Sans TC 與 Noto Sans SC，會依文字自動支援繁體、簡體及兩者混用；如需改用其他字型，可用 `OVERLAY_FONT_PATH` 指定 `.ttf` 或 `.ttc`
 
 功能選單說明：

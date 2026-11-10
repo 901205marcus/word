@@ -504,6 +504,40 @@ class ServiceRegressionTests(unittest.TestCase):
         text_mock.assert_called_once()
         choice_mock.assert_not_called()
 
+    def test_complete_overlay_batch_skips_settle_delay(self) -> None:
+        self.service.overlay_image_settle_seconds = 2.0
+        self.service._handle_line_text("fast-user", "user", "加字模式")
+        self.service._handle_line_text("fast-user", "user", "立即處理")
+
+        def fake_compose(image_path: str, text: str, output_path: Path) -> str:
+            Path(output_path).write_bytes(b"generated-jpeg")
+            return str(output_path)
+
+        started_at = time.monotonic()
+        with patch.object(
+            self.service,
+            "_download_line_message_content",
+            return_value=(b"complete-image", "image/jpeg"),
+        ), patch.object(
+            self.service.image_text_composer,
+            "compose",
+            side_effect=fake_compose,
+        ), patch.object(self.service, "_push_image_message", return_value=True), patch.object(
+            self.service, "_push_line_overlay_choice", return_value=True
+        ):
+            reply = self.service._handle_line_attachment(
+                "fast-user",
+                "user",
+                {"id": "complete-image", "type": "image"},
+                event_timestamp=1_000,
+                event_id="complete-image-event",
+            )
+            self.wait_for_overlay_job("fast-user", timeout=1)
+
+        self.assertLess(time.monotonic() - started_at, 1)
+        self.assertIn("照片已收齊", reply)
+        self.assertIn("立即在背景處理", reply)
+
     def test_overlay_image_redelivery_is_not_queued_twice(self) -> None:
         self.service._handle_line_text("image-duplicate-user", "user", "加字模式")
         self.service._handle_line_text("image-duplicate-user", "user", "第一段")

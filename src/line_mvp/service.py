@@ -54,8 +54,8 @@ class LineMVPService:
         self.rich_menu_manager = LineRichMenuManager(self.base_dir)
         self.overlay_pair_seconds = max(60, int(os.getenv("OVERLAY_PAIR_SECONDS", "1800")))
         self.overlay_image_settle_seconds = max(
-            0.2,
-            float(os.getenv("OVERLAY_IMAGE_SETTLE_SECONDS", "1.5")),
+            0.1,
+            float(os.getenv("OVERLAY_IMAGE_SETTLE_SECONDS", "0.6")),
         )
 
         self.apply_retry_delay = max(3, int(os.getenv("LINE_APPLY_RETRY_DELAY", "5")))
@@ -949,6 +949,11 @@ class LineMVPService:
 
         received = len(session.image_queue)
         self._start_overlay_batch_job(sender_id)
+        if received >= expected:
+            return (
+                f"照片已收齊：目前佇列 {received} 張、待配文字 {expected} 段。\n"
+                "數量相同，系統會依 LINE 傳送時間排序後立即在背景處理。"
+            )
         return (
             f"照片已收到：目前佇列 {received} 張、待配文字 {expected} 段。\n"
             f"系統會短暫等待約 {self.overlay_image_settle_seconds:g} 秒，依 LINE 傳送時間排序後"
@@ -978,6 +983,8 @@ class LineMVPService:
                 session = self.overlay_store.get(sender_id)
                 if not session or not session.active or not session.image_queue:
                     return
+                if len(session.image_queue) >= len(session.text_queue):
+                    break
                 signature = tuple(
                     (
                         str(part.get("event_timestamp", "")),
