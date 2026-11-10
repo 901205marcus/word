@@ -13,6 +13,7 @@ from PIL import Image
 from src.line_mvp.image_text_composer import ImageTextComposer
 from src.line_mvp.models import ActionType, InboxMessage, MessageStatus, ScheduleAction
 from src.line_mvp.parser import MessageParser
+from src.line_mvp.rich_menu import LineRichMenuManager
 from src.line_mvp.service import LineMVPService
 from src.line_mvp.word_editor import ScheduleWordEditor
 
@@ -167,6 +168,46 @@ class ServiceRegressionTests(unittest.TestCase):
             )
         self.assertEqual("true", result["replies"][0]["ok"])
         push_mock.assert_called()
+
+    def test_follow_event_opens_function_menu(self) -> None:
+        with patch.object(self.service, "_reply_line_function_menu", return_value=False), patch.object(
+            self.service,
+            "_push_line_function_menu",
+            return_value=True,
+        ) as push_mock:
+            result = self.service.ingest_webhook(
+                {
+                    "events": [
+                        {
+                            "type": "follow",
+                            "replyToken": "follow-token",
+                            "source": {"userId": "U-follow", "type": "user"},
+                        }
+                    ]
+                }
+            )
+        self.assertEqual("true", result["replies"][0]["ok"])
+        push_mock.assert_called_once_with("U-follow")
+
+    def test_menu_command_returns_button_template(self) -> None:
+        with patch.object(self.service, "_reply_line_function_menu", return_value=True) as menu_mock:
+            result = self.service.ingest_webhook(
+                {
+                    "events": [
+                        {
+                            "type": "message",
+                            "replyToken": "menu-token",
+                            "source": {"userId": "U-menu", "type": "user"},
+                            "message": {"type": "text", "text": "選單"},
+                        }
+                    ]
+                }
+            )
+        self.assertEqual("true", result["replies"][0]["ok"])
+        menu_mock.assert_called_once_with("menu-token")
+        message = self.service._function_menu_message()
+        self.assertEqual("template", message["type"])
+        self.assertEqual(4, len(message["template"]["actions"]))
 
     def test_recover_pending_jobs_starts_worker(self) -> None:
         item = self.make_item()
@@ -329,7 +370,7 @@ class ServiceRegressionTests(unittest.TestCase):
         self.assertEqual("確認", session.text_queue[0]["text"])
 
         end_reply = self.service._handle_line_text("separate-user", "user", "結束加字")
-        self.assertIn("恢復行程模式", end_reply)
+        self.assertIn("切換至行程模式", end_reply)
         self.service._handle_line_text("separate-user", "user", "7/21 11:00 新行程")
         updated = self.service.store.find_message("separate-user")
         self.assertIn("7/21 11:00 新行程", updated.raw_text)
@@ -374,6 +415,15 @@ class ImageTextComposerTests(unittest.TestCase):
             corner_colors = corner.convert("RGB").getcolors(maxcolors=1_000_000)
             self.assertGreater(len(center_colors), len(corner_colors))
 
+    def test_bundled_font_contains_distinct_traditional_chinese_glyphs(self) -> None:
+        font = ImageTextComposer._load_font(72)
+        self.assertTrue(ImageTextComposer._font_supports_cjk(font))
+        signatures = []
+        for character in "勝光山":
+            mask = font.getmask(character)
+            signatures.append((mask.size, bytes(mask)))
+        self.assertEqual(3, len(set(signatures)))
+
     def test_long_text_wraps_without_exceeding_canvas(self) -> None:
         source = self.tempdir / "portrait.png"
         output = self.tempdir / "portrait-result.jpg"
@@ -406,6 +456,35 @@ class ImageTextComposerTests(unittest.TestCase):
                 self.assertTrue(output.exists())
                 with Image.open(output) as result:
                     self.assertLessEqual(max(result.size), 2048)
+
+
+class RichMenuTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tempdir = Path(tempfile.mkdtemp(prefix="line-rich-menu-"))
+        assets = self.tempdir / "assets"
+        assets.mkdir(parents=True, exist_ok=True)
+        source_font = Path(__file__).resolve().parents[1] / "assets" / "NotoSansTC.ttf"
+        shutil.copy2(source_font, assets / "NotoSansTC.ttf")
+
+    def tearDown(self) -> None:
+        shutil.rmtree(self.tempdir, ignore_errors=True)
+
+    def test_rich_menu_has_four_ordered_message_actions(self) -> None:
+        manager = LineRichMenuManager(self.tempdir)
+        payload = manager._menu_payload()
+        self.assertTrue(payload["selected"])
+        self.assertEqual({"width": 2500, "height": 843}, payload["size"])
+        self.assertEqual(
+            ["行程模式", "加字模式", "加字狀態", "幫助"],
+            [area["action"]["text"] for area in payload["areas"]],
+        )
+
+    def test_rich_menu_image_renders_with_chinese_font(self) -> None:
+        manager = LineRichMenuManager(self.tempdir)
+        image_path = manager._render_image()
+        self.assertTrue(image_path.exists())
+        with Image.open(image_path) as image:
+            self.assertEqual((2500, 843), image.size)
 
 
 class ParserRegressionTests(unittest.TestCase):

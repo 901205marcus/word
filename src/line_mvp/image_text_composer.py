@@ -156,7 +156,21 @@ class ImageTextComposer:
             if not candidate:
                 continue
             try:
-                return ImageFont.truetype(candidate, size=size)
+                font = ImageFont.truetype(candidate, size=size)
+                try:
+                    font.set_variation_by_name("Bold")
+                except (OSError, ValueError):
+                    pass
+                if ImageTextComposer._font_supports_cjk(font):
+                    return font
             except (OSError, ValueError):
                 continue
-        raise RuntimeError("找不到可用字型，請設定 OVERLAY_FONT_PATH。")
+        raise RuntimeError("找不到支援繁體中文的字型，請設定 OVERLAY_FONT_PATH。")
+
+    @staticmethod
+    def _font_supports_cjk(font: ImageFont.FreeTypeFont) -> bool:
+        signatures = []
+        for character in "勝光山中文":
+            mask = font.getmask(character)
+            signatures.append((mask.size, bytes(mask)))
+        return len(set(signatures)) >= 4

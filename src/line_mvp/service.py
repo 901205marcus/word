@@ -21,17 +21,20 @@ from .map_guidance import MapGuidanceGenerator
 from .models import InboxMessage, MessageStatus, OverlaySession, ScheduleAction
 from .overlay_store import OverlaySessionStore
 from .parser import MessageParser
+from .rich_menu import LineRichMenuManager
 from .storage import InboxStore
 from .word_editor import ScheduleWordEditor
 
 
 class LineMVPService:
     APPLYING_MARKER = "[APPLYING]"
+    FUNCTION_MENU_SENTINEL = "__LINE_FUNCTION_MENU__"
     OVERLAY_COMMANDS = {
         "overlay_start",
         "overlay_end",
         "overlay_cancel",
         "overlay_status",
+        "schedule_mode",
     }
 
     def __init__(self, base_dir: str | Path):
@@ -46,6 +49,7 @@ class LineMVPService:
         self.map_guidance = MapGuidanceGenerator()
         self.preview_renderer = DocxPreviewRenderer()
         self.image_text_composer = ImageTextComposer()
+        self.rich_menu_manager = LineRichMenuManager(self.base_dir)
         self.overlay_pair_seconds = max(60, int(os.getenv("OVERLAY_PAIR_SECONDS", "1800")))
 
         self.apply_retry_delay = max(3, int(os.getenv("LINE_APPLY_RETRY_DELAY", "5")))
@@ -74,7 +78,18 @@ class LineMVPService:
         replies: list[dict[str, str]] = []
 
         for event in payload.get("events", []):
-            if event.get("type") != "message":
+            event_type = event.get("type")
+            if event_type == "follow":
+                reply_token = event.get("replyToken", "")
+                source = event.get("source", {})
+                sender_id = source.get("userId") or "unknown"
+                success = self._reply_line_function_menu(reply_token)
+                if not success:
+                    success = self._push_line_function_menu(sender_id)
+                replies.append({"sender_id": sender_id, "ok": "true" if success else "false"})
+                continue
+
+            if event_type != "message":
                 continue
 
             message = event.get("message", {})
@@ -88,10 +103,16 @@ class LineMVPService:
             if reply_text:
                 reply_token = event.get("replyToken", "")
                 success = False
-                if reply_token:
-                    success = self._reply_line_message(reply_token, reply_text)
-                if not success:
-                    success = self._push_text_message(sender_id, reply_text)
+                if reply_text == self.FUNCTION_MENU_SENTINEL:
+                    if reply_token:
+                        success = self._reply_line_function_menu(reply_token)
+                    if not success:
+                        success = self._push_line_function_menu(sender_id)
+                else:
+                    if reply_token:
+                        success = self._reply_line_message(reply_token, reply_text)
+                    if not success:
+                        success = self._push_text_message(sender_id, reply_text)
                 replies.append({"sender_id": sender_id, "ok": "true" if success else "false"})
 
             latest = self.store.find_active_draft(sender_id) or self.store.find_message(sender_id)
@@ -99,6 +120,18 @@ class LineMVPService:
                 created.append(latest)
 
         return {"created": created, "replies": replies}
+
+    def ensure_line_rich_menu(self) -> bool:
+        token = os.getenv("LINE_CHANNEL_ACCESS_TOKEN", "").strip()
+        enabled = os.getenv("LINE_RICH_MENU_ENABLED", "true").strip().lower()
+        if not token or enabled in {"0", "false", "no"}:
+            return False
+        for attempt in range(1, 6):
+            if self.rich_menu_manager.ensure_default():
+                return True
+            if attempt < 5:
+                time.sleep(min(30, attempt * 5))
+        return False
 
     def create_manual_message(self, raw_text: str, sender_id: str = "manual") -> InboxMessage:
         item = self.store.add_message(sender_id=sender_id, source_type="manual", raw_text=raw_text.strip())
@@ -203,7 +236,7 @@ class LineMVPService:
 
     def _handle_line_text_locked(self, sender_id: str, source_type: str, raw_text: str) -> str:
         command, code = self._parse_line_command(raw_text)
-        if command in self.OVERLAY_COMMANDS:
+        if command in self.OVERLAY_COMMANDS or command == "menu":
             return self._execute_line_command(sender_id, command, code)
 
         overlay_session = self.overlay_store.get(sender_id)
@@ -352,6 +385,11 @@ class LineMVPService:
             "help": "help",
             "幫助": "help",
             "指令": "help",
+            "menu": "menu",
+            "選單": "menu",
+            "功能選單": "menu",
+            "行程模式": "schedule_mode",
+            "行程管理": "schedule_mode",
             "/加字": "overlay_start",
             "加字模式": "overlay_start",
             "開始加字": "overlay_start",
@@ -376,6 +414,9 @@ class LineMVPService:
         return aliases.get(command, ""), code
 
     def _execute_line_command(self, sender_id: str, command: str, code: str) -> str:
+        if command == "menu":
+            return self.FUNCTION_MENU_SENTINEL
+
         if command in self.OVERLAY_COMMANDS:
             return self._execute_overlay_command(sender_id, command)
 
@@ -478,7 +519,7 @@ class LineMVPService:
             self.overlay_store.update(session)
             return f"已取消圖片加字並清空 {cleared} 段未配對文字，現在恢復行程模式。"
 
-        if command == "overlay_end":
+        if command in {"overlay_end", "schedule_mode"}:
             session.active = False
             session.updated_at = self._now_iso()
             self.overlay_store.update(session)
@@ -488,7 +529,7 @@ class LineMVPService:
                 if waiting
                 else "本批次已完成。"
             )
-            return f"已結束圖片加字模式，現在恢復行程模式。\n{suffix}"
+            return f"已切換至行程模式。\n{suffix}\n現在傳送的文字、圖片與 Word 會交給行程功能。"
 
         delivered = self._retry_overlay_outputs(sender_id, session)
         self.overlay_store.update(session)
@@ -594,6 +635,49 @@ class LineMVPService:
             },
         )
         return self._send_line_request(req, timeout=10, retries=2)
+
+    def _reply_line_function_menu(self, reply_token: str) -> bool:
+        token = os.getenv("LINE_CHANNEL_ACCESS_TOKEN", "").strip()
+        if not token or not reply_token:
+            return False
+        req = self._make_line_request(
+            "https://api.line.me/v2/bot/message/reply",
+            token,
+            {
+                "replyToken": reply_token,
+                "messages": [self._function_menu_message()],
+            },
+        )
+        return self._send_line_request(req, timeout=10, retries=2)
+
+    def _push_line_function_menu(self, to: str) -> bool:
+        token = os.getenv("LINE_CHANNEL_ACCESS_TOKEN", "").strip()
+        if not token or not to:
+            return False
+        req = self._make_line_request(
+            "https://api.line.me/v2/bot/message/push",
+            token,
+            {"to": to, "messages": [self._function_menu_message()]},
+        )
+        return self._send_line_request(req, timeout=15, retries=self.line_push_retries)
+
+    @staticmethod
+    def _function_menu_message() -> dict[str, Any]:
+        return {
+            "type": "template",
+            "altText": "功能選單：請選擇行程管理或圖片加字",
+            "template": {
+                "type": "buttons",
+                "title": "Marcus Schedule Bot",
+                "text": "請先選擇功能，再依系統提示進行下一步。",
+                "actions": [
+                    {"type": "message", "label": "行程管理", "text": "行程模式"},
+                    {"type": "message", "label": "圖片加字", "text": "加字模式"},
+                    {"type": "message", "label": "加字狀態", "text": "加字狀態"},
+                    {"type": "message", "label": "使用說明", "text": "幫助"},
+                ],
+            },
+        }
 
     def _push_text_message(self, to: str, text: str) -> bool:
         token = os.getenv("LINE_CHANNEL_ACCESS_TOKEN", "").strip()

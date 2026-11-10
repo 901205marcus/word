@@ -104,6 +104,8 @@ https://你的服務網址/webhook/line
 
 目前也支援直接在 LINE 內操作：
 
+- 預設展開的商家式 Rich Menu 提供「行程管理、圖片加字、加字狀態、使用說明」四個按鈕
+- 加好友時會主動顯示功能卡片；之後可輸入 `選單` 再次叫出
 - 直接傳行程內容，系統會回一個代碼
 - 可以連續補傳多則 LINE 行程內容
 - 可以直接上傳本次要套用的 `.docx` Word 模板
@@ -145,7 +147,14 @@ https://你的服務網址/webhook/line
 - 輸入 `加字狀態` 可查看待配對數量；輸入 `結束加字` 返回行程模式
 - 輸入 `取消加字` 會清空未配對文字並返回行程模式
 - 配對時間可用 `OVERLAY_PAIR_SECONDS` 調整，預設為 `1800` 秒
-- 如果 Render 找不到中文字型，可用 `OVERLAY_FONT_PATH` 指定 `.ttf` 或 `.ttc` 字型檔
+- 專案已內建 Noto Sans TC 繁體中文字型；如需改用其他字型，可用 `OVERLAY_FONT_PATH` 指定 `.ttf` 或 `.ttc`
+
+功能選單說明：
+
+- LINE 不會在每次開啟聊天室時傳送 webhook，因此機器人無法偵測真正的「每次登入」
+- 專案會透過 Messaging API 自動設定 `selected: true` 的預設 Rich Menu，重新開啟聊天室時會預設展開
+- 若選單被手動收合，可點聊天列的 `選擇功能`，或傳送 `選單`
+- 可用 `LINE_RICH_MENU_ENABLED=false` 停用自動建立 Rich Menu
 
 健康檢查：
 

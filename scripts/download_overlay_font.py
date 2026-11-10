@@ -22,7 +22,10 @@ def main() -> None:
             target.write_bytes(response.read())
         print(f"Downloaded overlay font: {target}")
     except Exception as exc:
-        print(f"Warning: could not download overlay font: {exc}")
+        raise SystemExit(f"Could not prepare required overlay font: {exc}") from exc
+
+    if target.stat().st_size <= 1_000_000:
+        raise SystemExit("Downloaded overlay font is unexpectedly small.")
 
 
 if __name__ == "__main__":

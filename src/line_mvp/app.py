@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import threading
 from dataclasses import asdict
 from pathlib import Path
 
@@ -25,6 +26,11 @@ app.mount("/files", StaticFiles(directory=str(OUTPUT_DIR)), name="files")
 @app.on_event("startup")
 def startup_recover_jobs():
     service.recover_pending_jobs()
+    threading.Thread(
+        target=service.ensure_line_rich_menu,
+        daemon=True,
+        name="line-rich-menu-setup",
+    ).start()
 
 
 @app.get("/health")
