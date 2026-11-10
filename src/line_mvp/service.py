@@ -13,7 +13,7 @@ from datetime import datetime
 from hashlib import sha256
 from pathlib import Path
 from typing import Any
-from urllib import request
+from urllib import error, request
 
 from .attachment_reader import AttachmentReader
 from .docx_preview import DocxPreviewRenderer
@@ -790,6 +790,11 @@ class LineMVPService:
         if command == "overlay_retry":
             if not session.pending_outputs:
                 self.overlay_store.update(session)
+                if missing_outputs:
+                    return (
+                        f"檢查到 {missing_outputs} 張暫存成品已因服務重啟或部署而不存在。\n"
+                        "請重新傳送該批文字與照片；新版本會使用獨立的小型預覽圖回傳。"
+                    )
                 return "目前沒有等待補送的圖片。可以繼續傳文字與照片。"
 
             output_path = session.pending_outputs[0]
@@ -1377,6 +1382,17 @@ class LineMVPService:
         if not token or not to or not image_url:
             return False
 
+        source_path = Path(image_path)
+        preview_path = source_path.with_name(f"{source_path.stem}_line_preview.jpg")
+        try:
+            self.image_text_composer.create_preview(source_path, preview_path)
+        except Exception as exc:
+            logger.warning("LINE image preview creation failed path=%s error=%s", source_path, exc)
+            return False
+        preview_url = self._public_output_url(str(preview_path), base_url)
+        if not preview_url:
+            return False
+
         req = self._make_line_request(
             "https://api.line.me/v2/bot/message/push",
             token,
@@ -1386,7 +1402,7 @@ class LineMVPService:
                     {
                         "type": "image",
                         "originalContentUrl": image_url,
-                        "previewImageUrl": image_url,
+                        "previewImageUrl": preview_url,
                     }
                 ],
             },
@@ -1445,7 +1461,27 @@ class LineMVPService:
             try:
                 with request.urlopen(req, timeout=timeout) as response:
                     return 200 <= response.status < 300
-            except Exception:
+            except error.HTTPError as exc:
+                body = exc.read().decode("utf-8", errors="replace")[:1000]
+                logger.warning(
+                    "LINE request rejected status=%s url=%s body=%s",
+                    exc.code,
+                    req.full_url,
+                    body,
+                )
+                if 400 <= exc.code < 500 and exc.code != 429:
+                    return False
+                if attempt >= retries:
+                    return False
+                time.sleep(min(10, attempt * 2))
+            except Exception as exc:
+                logger.warning(
+                    "LINE request failed attempt=%s/%s url=%s error=%s",
+                    attempt,
+                    retries,
+                    req.full_url,
+                    exc,
+                )
                 if attempt >= retries:
                     return False
                 time.sleep(min(10, attempt * 2))

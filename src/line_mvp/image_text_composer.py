@@ -66,17 +66,44 @@ class ImageTextComposer:
         self._save_for_line(image, output)
         return str(output)
 
+    def create_preview(
+        self,
+        image_path: str | Path,
+        output_path: str | Path,
+        max_output_bytes: int = 900 * 1024,
+        max_dimension: int = 1200,
+    ) -> str:
+        source = Path(image_path)
+        if not source.is_file():
+            raise FileNotFoundError(f"找不到預覽原圖：{source.name}")
+
+        output = Path(output_path)
+        output.parent.mkdir(parents=True, exist_ok=True)
+        with Image.open(source) as opened:
+            image = ImageOps.exif_transpose(opened).convert("RGB")
+        image.thumbnail((max_dimension, max_dimension), Image.Resampling.LANCZOS)
+        self._save_jpeg_with_limit(image, output, max_output_bytes)
+        return str(output)
+
     def _save_for_line(self, image: Image.Image, output: Path) -> None:
+        self._save_jpeg_with_limit(image, output, self.max_output_bytes)
+
+    @staticmethod
+    def _save_jpeg_with_limit(
+        image: Image.Image,
+        output: Path,
+        max_output_bytes: int,
+    ) -> None:
         for quality in (92, 88, 84, 80, 76, 72):
             image.save(output, format="JPEG", quality=quality, optimize=False, progressive=True)
-            if output.stat().st_size <= self.max_output_bytes:
+            if output.stat().st_size <= max_output_bytes:
                 return
 
         # Keep the original pixel dimensions unless compression cannot meet LINE's limit.
         resized = image
         for _ in range(8):
             ratio = math.sqrt(
-                self.max_output_bytes / max(1, output.stat().st_size)
+                max_output_bytes / max(1, output.stat().st_size)
             ) * 0.92
             ratio = max(0.5, min(0.92, ratio))
             next_size = (
@@ -97,7 +124,7 @@ class ImageTextComposer:
                     optimize=False,
                     progressive=True,
                 )
-                if output.stat().st_size <= self.max_output_bytes:
+                if output.stat().st_size <= max_output_bytes:
                     return
 
         raise ValueError("圖片壓縮後仍超過 LINE 可回傳容量，請改用較小的原圖。")

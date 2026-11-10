@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+import os
 import shutil
 import tempfile
 import threading
@@ -723,6 +725,43 @@ class ServiceRegressionTests(unittest.TestCase):
         updated = self.service.overlay_store.get("retry-user")
         self.assertEqual(1, len(updated.pending_outputs))
         self.assertIn("等待手動補送", updated.last_error)
+
+    def test_line_image_push_uses_a_distinct_preview_under_one_megabyte(self) -> None:
+        original = self.service.output_dir / "high-resolution.jpg"
+        channels = [Image.effect_noise((2400, 1800), 120) for _ in range(3)]
+        Image.merge("RGB", channels).save(original, quality=98)
+        original_size = original.stat().st_size
+
+        with patch.dict(
+            os.environ,
+            {
+                "LINE_CHANNEL_ACCESS_TOKEN": "test-token",
+                "PUBLIC_BASE_URL": "https://word.example.com",
+            },
+        ), patch.object(
+            self.service,
+            "_send_line_request",
+            return_value=True,
+        ) as send_mock:
+            pushed = self.service._push_image_message("user-preview", str(original))
+
+        self.assertTrue(pushed)
+        request_obj = send_mock.call_args.args[0]
+        payload = json.loads(request_obj.data.decode("utf-8"))
+        message = payload["messages"][0]
+        self.assertNotEqual(message["originalContentUrl"], message["previewImageUrl"])
+        self.assertTrue(message["originalContentUrl"].endswith("/high-resolution.jpg"))
+        self.assertTrue(message["previewImageUrl"].endswith("/high-resolution_line_preview.jpg"))
+
+        preview = self.service.output_dir / "high-resolution_line_preview.jpg"
+        self.assertTrue(preview.is_file())
+        self.assertLessEqual(preview.stat().st_size, 900 * 1024)
+        self.assertEqual(original_size, original.stat().st_size)
+        with Image.open(original) as original_image, Image.open(preview) as preview_image:
+            self.assertEqual(
+                original_image.width / original_image.height,
+                preview_image.width / preview_image.height,
+            )
 
     def test_manual_overlay_retry_sends_one_saved_image(self) -> None:
         self.service._handle_line_text("manual-retry-user", "user", "加字模式")
