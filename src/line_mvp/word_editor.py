@@ -20,6 +20,7 @@ WEEKDAY_TEXT = "一二三四五六日"
 @dataclass(slots=True)
 class DayHeader:
     row_idx: int
+    year: int
     month: int
     day: int
     raw_text: str
@@ -133,20 +134,26 @@ class ScheduleWordEditor:
 
     def list_day_headers(self) -> list[DayHeader]:
         headers: list[DayHeader] = []
+        inferred_year = self.document_year
+        previous_month: int | None = None
         for row_idx in range(len(self.table.rows)):
             text = " | ".join(row_texts(self.table, row_idx))
             match = DAY_HEADER_RE.search(text)
             if not match:
                 continue
+            month = int(match.group("month"))
+            if previous_month is not None and month < previous_month:
+                inferred_year += 1
             headers.append(
                 DayHeader(
                     row_idx=row_idx,
-                    month=int(match.group("month")),
+                    year=inferred_year,
+                    month=month,
                     day=int(match.group("day")),
                     raw_text=text,
                 )
             )
-        headers.sort(key=lambda item: (item.month, item.day, item.row_idx))
+            previous_month = month
         return headers
 
     def find_day_row(self, date_text: str) -> int | None:
@@ -371,7 +378,7 @@ class ScheduleWordEditor:
         return previous_header, next_header
 
     def _header_date(self, header: DayHeader) -> date:
-        return date(self.document_year, header.month, header.day)
+        return date(header.year, header.month, header.day)
 
     def _set_day_header_text(self, row_idx: int, target_date: date) -> None:
         row = self.table.rows[row_idx]
@@ -410,10 +417,9 @@ class ScheduleWordEditor:
         return ""
 
     def _extract_header_date(self, row_idx: int) -> date | None:
-        for text in row_texts(self.table, row_idx):
-            match = DAY_HEADER_RE.search(text)
-            if match:
-                return date(self.document_year, int(match.group("month")), int(match.group("day")))
+        for header in self.list_day_headers():
+            if header.row_idx == row_idx:
+                return self._header_date(header)
         return None
 
     def _locate_row(self, target_tr) -> int:
@@ -454,12 +460,16 @@ class ScheduleWordEditor:
     def _date_in_document_year(self, value: str) -> date:
         normalized = normalize_date(value)
         month_text, day_text = normalized.split("/", 1)
-        return date(self.document_year, int(month_text), int(day_text))
+        month = int(month_text)
+        day = int(day_text)
+        today = datetime.now().date()
+        candidate = date(today.year, month, day)
+        if candidate < today and month < today.month:
+            candidate = date(today.year + 1, month, day)
+        return candidate
 
     def _today_in_document_year(self) -> date:
-        today = datetime.now().date()
-        day_value = min(today.day, self._month_last_day(self.document_year, today.month))
-        return date(self.document_year, today.month, day_value)
+        return datetime.now().date()
 
     def _add_months(self, current: date, months: int) -> date:
         month_index = current.month - 1 + months

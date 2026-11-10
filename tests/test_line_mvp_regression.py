@@ -8,7 +8,9 @@ from pathlib import Path
 from unittest.mock import patch
 
 from docx import Document
+from PIL import Image
 
+from src.line_mvp.image_text_composer import ImageTextComposer
 from src.line_mvp.models import ActionType, InboxMessage, MessageStatus, ScheduleAction
 from src.line_mvp.parser import MessageParser
 from src.line_mvp.service import LineMVPService
@@ -205,6 +207,106 @@ class ServiceRegressionTests(unittest.TestCase):
         self.assertEqual(3, calls["count"])
         self.assertFalse(latest.processing)
         self.assertTrue(any("自動重試" in text for text in pushed))
+
+    def test_overlay_text_first_then_image(self) -> None:
+        self.service._handle_line_text("user-1", "user", "中央大標題")
+        source = self.tempdir / "source.jpg"
+        Image.new("RGB", (900, 600), (40, 90, 160)).save(source, format="JPEG")
+        content = source.read_bytes()
+
+        with patch.object(self.service, "_download_line_message_content", return_value=(content, "image/jpeg")), patch.object(
+            self.service, "_push_image_message", return_value=True
+        ):
+            reply = self.service._handle_line_attachment(
+                "user-1",
+                "user",
+                {"id": "image-1", "type": "image"},
+            )
+
+        self.assertIn("合成完成", reply)
+        item = self.service.store.find_message("user-1")
+        self.assertTrue(Path(item.overlay_output_path).exists())
+        self.assertEqual("", item.overlay_text)
+        self.assertEqual("", item.overlay_image_path)
+
+    def test_overlay_image_first_then_text(self) -> None:
+        source = self.tempdir / "source-first.jpg"
+        Image.new("RGB", (800, 800), (90, 130, 70)).save(source, format="JPEG")
+        content = source.read_bytes()
+
+        with patch.object(self.service, "_download_line_message_content", return_value=(content, "image/jpeg")), patch.object(
+            self.service.attachment_reader, "extract_text", side_effect=ValueError("no ocr")
+        ):
+            waiting_reply = self.service._handle_line_attachment(
+                "user-2",
+                "user",
+                {"id": "image-2", "type": "image"},
+            )
+        self.assertIn("請在 10 分鐘內", waiting_reply)
+
+        with patch.object(self.service, "_push_image_message", return_value=True):
+            reply = self.service._handle_line_text("user-2", "user", "照片正中央")
+        self.assertIn("合成完成", reply)
+        item = self.service.store.find_message("user-2")
+        self.assertTrue(Path(item.overlay_output_path).exists())
+
+
+class ImageTextComposerTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tempdir = Path(tempfile.mkdtemp(prefix="line-overlay-"))
+
+    def tearDown(self) -> None:
+        shutil.rmtree(self.tempdir, ignore_errors=True)
+
+    def test_text_is_drawn_in_center_region(self) -> None:
+        source = self.tempdir / "source.jpg"
+        output = self.tempdir / "result.jpg"
+        background = (24, 80, 145)
+        Image.new("RGB", (1200, 800), background).save(source, format="JPEG", quality=100)
+
+        result_path = ImageTextComposer().compose(source, "中央大字測試", output)
+        self.assertEqual(str(output), result_path)
+        self.assertTrue(output.exists())
+
+        with Image.open(output) as result:
+            center = result.crop((350, 220, 850, 580))
+            corner = result.crop((0, 0, 120, 120))
+            center_colors = center.convert("RGB").getcolors(maxcolors=1_000_000)
+            corner_colors = corner.convert("RGB").getcolors(maxcolors=1_000_000)
+            self.assertGreater(len(center_colors), len(corner_colors))
+
+    def test_long_text_wraps_without_exceeding_canvas(self) -> None:
+        source = self.tempdir / "portrait.png"
+        output = self.tempdir / "portrait-result.jpg"
+        Image.new("RGBA", (700, 1100), (180, 100, 80, 255)).save(source)
+        text = "這是一段比較長的文字，系統需要自動換行，而且仍然保持在照片正中央。"
+        ImageTextComposer().compose(source, text, output)
+        with Image.open(output) as result:
+            self.assertEqual((700, 1100), result.size)
+
+    def test_ten_layout_variants(self) -> None:
+        variants = [
+            ((1200, 630), "活動開始"),
+            ((630, 1200), "今晚七點集合"),
+            ((900, 900), "重要通知"),
+            ((1600, 900), "這是一行橫式大標題"),
+            ((900, 1600), "直式照片\n第二行文字"),
+            ((640, 480), "短字"),
+            ((480, 640), "請記得攜帶證件與相關資料"),
+            ((1024, 512), "第一行\n第二行\n第三行"),
+            ((512, 1024), "比較長的文字會自動換行並保持置中"),
+            ((1400, 1000), "LINE 照片自動加字測試 10"),
+        ]
+        composer = ImageTextComposer()
+        for index, (size, text) in enumerate(variants, start=1):
+            with self.subTest(index=index, size=size):
+                source = self.tempdir / f"variant-{index}.png"
+                output = self.tempdir / f"variant-{index}.jpg"
+                Image.new("RGB", size, (35 + index * 5, 80, 120)).save(source)
+                composer.compose(source, text, output)
+                self.assertTrue(output.exists())
+                with Image.open(output) as result:
+                    self.assertLessEqual(max(result.size), 2048)
 
 
 class ParserRegressionTests(unittest.TestCase):

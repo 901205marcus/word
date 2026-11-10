@@ -16,6 +16,7 @@ from urllib import request
 
 from .attachment_reader import AttachmentReader
 from .docx_preview import DocxPreviewRenderer
+from .image_text_composer import ImageTextComposer
 from .map_guidance import MapGuidanceGenerator
 from .models import InboxMessage, MessageStatus, ScheduleAction
 from .parser import MessageParser
@@ -36,6 +37,8 @@ class LineMVPService:
         self.attachment_reader = AttachmentReader(base_dir)
         self.map_guidance = MapGuidanceGenerator()
         self.preview_renderer = DocxPreviewRenderer()
+        self.image_text_composer = ImageTextComposer()
+        self.overlay_pair_seconds = max(60, int(os.getenv("OVERLAY_PAIR_SECONDS", "600")))
 
         self.apply_retry_delay = max(3, int(os.getenv("LINE_APPLY_RETRY_DELAY", "5")))
         self.apply_retry_max_delay = max(
@@ -196,10 +199,15 @@ class LineMVPService:
             item.raw_text = self._merge_text(item.raw_text, raw_text)
             item.last_progress_at = self._now_iso()
 
+        item.overlay_text = raw_text
+        item.overlay_text_at = self._now_iso()
         item.actions = self._enrich_actions(self.parser.parse(item.raw_text))
         item.error = ""
         item.last_error = ""
         self.store.update_message(item)
+        overlay_reply = self._try_create_overlay(sender_id, item)
+        if overlay_reply:
+            return overlay_reply
         return self._format_created_reply(item)
 
     def _handle_line_attachment(self, sender_id: str, source_type: str, message: dict[str, Any]) -> str:
@@ -221,6 +229,14 @@ class LineMVPService:
         item.uploaded_files.append(str(saved_path))
         item.last_progress_at = self._now_iso()
 
+        if message.get("type") == "image":
+            item.overlay_image_path = str(saved_path)
+            item.overlay_image_at = self._now_iso()
+            self.store.update_message(item)
+            overlay_reply = self._try_create_overlay(sender_id, item)
+            if overlay_reply:
+                return overlay_reply
+
         if saved_path.suffix.lower() == ".docx":
             item.template_docx_path = str(saved_path)
             item.error = ""
@@ -234,6 +250,8 @@ class LineMVPService:
             item.error = str(exc)
             item.last_error = str(exc)
             self.store.update_message(item)
+            if message.get("type") == "image":
+                return "圖片已收到。請在 10 分鐘內再傳送要放在照片中央的文字。"
             return f"附件已收到，但文字辨識失敗：{saved_path.name}\n錯誤：{exc}"
 
         item.raw_text = self._merge_text(item.raw_text, f"[附件：{saved_path.name}]\n{extracted}")
@@ -479,6 +497,78 @@ class LineMVPService:
         )
         return self._send_line_request(req, timeout=15, retries=self.line_push_retries)
 
+    def _try_create_overlay(self, sender_id: str, item: InboxMessage) -> str:
+        if not item.overlay_text.strip() or not item.overlay_image_path.strip():
+            return ""
+
+        try:
+            text_time = datetime.fromisoformat(item.overlay_text_at)
+            image_time = datetime.fromisoformat(item.overlay_image_at)
+        except (TypeError, ValueError):
+            return ""
+
+        if abs((text_time - image_time).total_seconds()) > self.overlay_pair_seconds:
+            if text_time > image_time:
+                item.overlay_image_path = ""
+                item.overlay_image_at = ""
+            else:
+                item.overlay_text = ""
+                item.overlay_text_at = ""
+            self.store.update_message(item)
+            return ""
+
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+        output_path = self.output_dir / f"line_overlay_{self._message_code(item).lower()}_{timestamp}.jpg"
+        try:
+            result_path = self.image_text_composer.compose(
+                item.overlay_image_path,
+                item.overlay_text,
+                output_path,
+            )
+        except Exception as exc:
+            item.last_error = f"圖片文字合成失敗：{exc}"
+            item.last_progress_at = self._now_iso()
+            self.store.update_message(item)
+            return f"圖片文字合成失敗：{exc}"
+
+        item.overlay_output_path = result_path
+        item.last_progress_at = self._now_iso()
+        if not self._push_image_message(sender_id, result_path):
+            item.last_error = "圖片已合成，但 LINE 圖片回傳失敗。"
+            self.store.update_message(item)
+            return "圖片已合成，但 LINE 回傳失敗；系統會保留照片與文字，請再傳一次文字重試。"
+
+        item.overlay_text = ""
+        item.overlay_text_at = ""
+        item.overlay_image_path = ""
+        item.overlay_image_at = ""
+        item.last_error = ""
+        self.store.update_message(item)
+        return "圖片文字合成完成，已把大字置中後回傳。"
+
+    def _push_image_message(self, to: str, image_path: str) -> bool:
+        token = os.getenv("LINE_CHANNEL_ACCESS_TOKEN", "").strip()
+        base_url = os.getenv("PUBLIC_BASE_URL", "").rstrip("/")
+        image_url = self._public_output_url(image_path, base_url)
+        if not token or not to or not image_url:
+            return False
+
+        req = self._make_line_request(
+            "https://api.line.me/v2/bot/message/push",
+            token,
+            {
+                "to": to,
+                "messages": [
+                    {
+                        "type": "image",
+                        "originalContentUrl": image_url,
+                        "previewImageUrl": image_url,
+                    }
+                ],
+            },
+        )
+        return self._send_line_request(req, timeout=20, retries=self.line_push_retries)
+
     def _push_apply_assets(self, to: str, item: InboxMessage) -> bool:
         token = os.getenv("LINE_CHANNEL_ACCESS_TOKEN", "").strip()
         base_url = os.getenv("PUBLIC_BASE_URL", "").rstrip("/")
@@ -642,7 +732,8 @@ class LineMVPService:
             f"案件代碼：{code}\n"
             f"附件檔名：{filename}\n"
             f"目前累積行程：{len(item.actions)} 筆\n"
-            f"若要看摘要，可回覆「查看 {code}」。"
+            f"若要看摘要，可回覆「查看 {code}」。\n"
+            "如果這是要加字的照片，請在 10 分鐘內傳送文字，系統會自動把大字放在照片正中央。"
         )
 
     def _format_item_summary(self, item: InboxMessage) -> str:
@@ -689,7 +780,8 @@ class LineMVPService:
             "2. 確認 案件代碼\n"
             "3. 略過 案件代碼\n"
             "4. 套用 案件代碼\n"
-            "也可以直接傳新的行程文字、圖片、PDF、Word 模板給我。"
+            "也可以直接傳新的行程文字、圖片、PDF、Word 模板給我。\n"
+            "圖片加字：照片與文字在 10 分鐘內先後傳送，會自動合成並回傳。"
         )
 
     def _retry_delay_seconds(self, attempt: int) -> int:

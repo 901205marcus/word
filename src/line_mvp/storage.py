@@ -118,4 +118,9 @@ class InboxStore:
             apply_attempts=int(item.get("apply_attempts", 0)),
             last_error=item.get("last_error", ""),
             last_progress_at=item.get("last_progress_at", ""),
+            overlay_text=item.get("overlay_text", ""),
+            overlay_text_at=item.get("overlay_text_at", ""),
+            overlay_image_path=item.get("overlay_image_path", ""),
+            overlay_image_at=item.get("overlay_image_at", ""),
+            overlay_output_path=item.get("overlay_output_path", ""),
         )

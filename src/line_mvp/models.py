@@ -49,6 +49,11 @@ class InboxMessage:
     apply_attempts: int = 0
     last_error: str = ""
     last_progress_at: str = ""
+    overlay_text: str = ""
+    overlay_text_at: str = ""
+    overlay_image_path: str = ""
+    overlay_image_at: str = ""
+    overlay_output_path: str = ""
 
 
 @dataclass(slots=True)
