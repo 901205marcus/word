@@ -822,7 +822,18 @@ class ServiceRegressionTests(unittest.TestCase):
         session.pending_outputs = [str(output)]
         self.service.overlay_store.update(session)
 
-        with patch.object(self.service, "_push_image_message", return_value=False):
+        with patch.dict(
+            os.environ,
+            {"PUBLIC_BASE_URL": "https://word.example.com"},
+        ), patch.object(
+            self.service,
+            "_push_image_message",
+            return_value=False,
+        ), patch.object(
+            self.service,
+            "_last_line_request_error",
+            return_value='HTTP 400: {"message":"invalid image URL"}',
+        ):
             reply = self.service._handle_line_text(
                 "manual-fail-user",
                 "user",
@@ -830,9 +841,27 @@ class ServiceRegressionTests(unittest.TestCase):
             )
 
         self.assertIn("補送失敗", reply)
+        self.assertIn(
+            "https://word.example.com/files/failed.jpg",
+            reply,
+        )
+        self.assertIn("HTTP 400", reply)
         updated = self.service.overlay_store.get("manual-fail-user")
         self.assertEqual([str(output)], updated.pending_outputs)
         self.assertIn("成品仍安全保留", updated.last_error)
+
+    def test_public_base_url_ignores_render_dashboard_url(self) -> None:
+        with patch.dict(
+            os.environ,
+            {
+                "PUBLIC_BASE_URL": "https://dashboard.render.com/web/example",
+                "RENDER_EXTERNAL_URL": "https://word-runtime.onrender.com",
+            },
+        ):
+            self.assertEqual(
+                "https://word-runtime.onrender.com",
+                self.service.public_base_url(),
+            )
 
     def test_overlay_start_cleans_legacy_queue_and_missing_outputs(self) -> None:
         session = self.service.overlay_store.get_or_create("legacy-user")

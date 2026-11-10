@@ -36,7 +36,11 @@ def startup_recover_jobs():
 
 @app.get("/health")
 def health():
-    return {"ok": True}
+    return {
+        "ok": True,
+        "commit": os.getenv("RENDER_GIT_COMMIT", "local")[:7],
+        "public_base_url": service.public_base_url(),
+    }
 
 
 @app.get("/", response_class=HTMLResponse)

@@ -14,6 +14,7 @@ from hashlib import sha256
 from pathlib import Path
 from typing import Any
 from urllib import error, request
+from urllib.parse import urlparse
 
 from .attachment_reader import AttachmentReader
 from .docx_preview import DocxPreviewRenderer
@@ -72,6 +73,7 @@ class LineMVPService:
         self._sender_locks: dict[str, threading.RLock] = {}
         self._overlay_job_lock = threading.Lock()
         self._active_overlay_jobs: set[str] = set()
+        self._line_request_state = threading.local()
 
     def verify_signature(self, body: bytes, signature: str) -> bool:
         secret = os.getenv("LINE_CHANNEL_SECRET", "").strip()
@@ -843,10 +845,29 @@ class LineMVPService:
             session.last_error = "手動補送失敗；成品仍安全保留"
             session.updated_at = self._now_iso()
             self.overlay_store.update(session)
+            download_url = self._public_output_url(
+                output_path,
+                self.public_base_url(),
+            )
+            error_detail = self._last_line_request_error()
+            fallback_lines = [
+                "圖片訊息補送失敗，但成品沒有遺失。",
+                f"仍等待補送：{len(session.pending_outputs)} 張。",
+            ]
+            if download_url:
+                fallback_lines.extend(
+                    [
+                        "請先用下面連結直接下載成品：",
+                        download_url,
+                    ]
+                )
+            if error_detail:
+                fallback_lines.append(f"LINE 拒絕原因：{error_detail}")
+            fallback_lines.append(
+                "稍後仍可再次輸入「補送照片」，不需要重新傳文字或照片。"
+            )
             return cleanup_note + (
-                "圖片補送失敗，但成品沒有遺失。\n"
-                f"仍等待補送：{len(session.pending_outputs)} 張。\n"
-                "請稍後再次輸入「補送照片」，不需要重新傳文字或照片。"
+                "\n".join(fallback_lines)
             )
 
         if command == "overlay_process":
@@ -1364,10 +1385,17 @@ class LineMVPService:
         if pushed:
             lines.append("合成圖片已回傳；本組文字與照片不會再被使用。")
         else:
-            lines.append(
-                "圖片已完成但 LINE 回傳失敗，系統已保留成品；"
-                "請輸入「補送圖片」單次重試。"
+            lines.append("圖片已完成但 LINE 圖片訊息回傳失敗，系統已保留成品。")
+            download_url = self._public_output_url(
+                result_path,
+                self.public_base_url(),
             )
+            if download_url:
+                lines.extend(["請先用下面連結直接下載成品：", download_url])
+            error_detail = self._last_line_request_error()
+            if error_detail:
+                lines.append(f"LINE 拒絕原因：{error_detail}")
+            lines.append("仍可輸入「補送照片」單次重試。")
         if delivered:
             lines.append(f"另外補送了先前等待中的圖片：{delivered} 張。")
         if expired:
@@ -1405,9 +1433,12 @@ class LineMVPService:
 
     def _push_image_message(self, to: str, image_path: str) -> bool:
         token = os.getenv("LINE_CHANNEL_ACCESS_TOKEN", "").strip()
-        base_url = os.getenv("PUBLIC_BASE_URL", "").rstrip("/")
+        base_url = self.public_base_url()
         image_url = self._public_output_url(image_path, base_url)
         if not token or not to or not image_url:
+            self._set_line_request_error(
+                "缺少 LINE 權杖、收件者或有效的公開成品網址"
+            )
             return False
 
         source_path = Path(image_path)
@@ -1416,9 +1447,11 @@ class LineMVPService:
             self.image_text_composer.create_preview(source_path, preview_path)
         except Exception as exc:
             logger.warning("LINE image preview creation failed path=%s error=%s", source_path, exc)
+            self._set_line_request_error(f"建立 LINE 預覽圖失敗：{exc}")
             return False
         preview_url = self._public_output_url(str(preview_path), base_url)
         if not preview_url:
+            self._set_line_request_error("無法建立 LINE 預覽圖的公開網址")
             return False
 
         req = self._make_line_request(
@@ -1485,12 +1518,19 @@ class LineMVPService:
         )
 
     def _send_line_request(self, req: request.Request, timeout: int, retries: int) -> bool:
+        self._set_line_request_error("")
         for attempt in range(1, retries + 1):
             try:
                 with request.urlopen(req, timeout=timeout) as response:
-                    return 200 <= response.status < 300
+                    if 200 <= response.status < 300:
+                        return True
+                    self._set_line_request_error(f"HTTP {response.status}")
+                    return False
             except error.HTTPError as exc:
                 body = exc.read().decode("utf-8", errors="replace")[:1000]
+                self._set_line_request_error(
+                    f"HTTP {exc.code}: {self._compact_line_error(body)}"
+                )
                 logger.warning(
                     "LINE request rejected status=%s url=%s body=%s",
                     exc.code,
@@ -1503,6 +1543,7 @@ class LineMVPService:
                     return False
                 time.sleep(min(10, attempt * 2))
             except Exception as exc:
+                self._set_line_request_error(self._compact_line_error(str(exc)))
                 logger.warning(
                     "LINE request failed attempt=%s/%s url=%s error=%s",
                     attempt,
@@ -1514,6 +1555,32 @@ class LineMVPService:
                     return False
                 time.sleep(min(10, attempt * 2))
         return False
+
+    def public_base_url(self) -> str:
+        candidates = [
+            os.getenv("PUBLIC_BASE_URL", "").strip().rstrip("/"),
+            os.getenv("RENDER_EXTERNAL_URL", "").strip().rstrip("/"),
+            "https://word-w3et.onrender.com",
+        ]
+        for candidate in candidates:
+            parsed = urlparse(candidate)
+            if (
+                parsed.scheme == "https"
+                and parsed.netloc
+                and parsed.netloc.lower() != "dashboard.render.com"
+            ):
+                return candidate
+        return ""
+
+    def _set_line_request_error(self, message: str) -> None:
+        self._line_request_state.last_error = self._compact_line_error(message)
+
+    def _last_line_request_error(self) -> str:
+        return str(getattr(self._line_request_state, "last_error", ""))
+
+    @staticmethod
+    def _compact_line_error(message: str) -> str:
+        return " ".join(str(message).split())[:300]
 
     def _public_output_url(self, path: str, base_url: str) -> str:
         if not path or not base_url:
