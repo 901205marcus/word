@@ -827,7 +827,7 @@ class ImageTextComposerTests(unittest.TestCase):
             pixel_count = upper_center.width * upper_center.height
             self.assertLess(dark_pixels / pixel_count, 0.16)
 
-    def test_default_line_image_is_limited_for_fast_delivery(self) -> None:
+    def test_default_line_image_keeps_original_dimensions(self) -> None:
         source = self.tempdir / "large-source.jpg"
         output = self.tempdir / "large-result.jpg"
         Image.new("RGB", (3200, 2400), (70, 110, 150)).save(source, quality=95)
@@ -835,7 +835,17 @@ class ImageTextComposerTests(unittest.TestCase):
         ImageTextComposer().compose(source, "快速回傳", output)
 
         with Image.open(output) as result:
-            self.assertLessEqual(max(result.size), 1600)
+            self.assertEqual((3200, 2400), result.size)
+
+    def test_optional_max_dimension_still_allows_manual_size_limit(self) -> None:
+        source = self.tempdir / "manual-limit-source.jpg"
+        output = self.tempdir / "manual-limit-result.jpg"
+        Image.new("RGB", (2400, 1800), (70, 110, 150)).save(source, quality=95)
+
+        ImageTextComposer(max_dimension=1200).compose(source, "手動限制", output)
+
+        with Image.open(output) as result:
+            self.assertEqual((1200, 900), result.size)
 
     def test_bundled_font_contains_distinct_traditional_chinese_glyphs(self) -> None:
         font = ImageTextComposer._load_font(72)

@@ -8,13 +8,11 @@ from PIL import Image, ImageDraw, ImageFont, ImageOps
 
 class ImageTextComposer:
     def __init__(self, max_dimension: int | None = None):
-        self.max_dimension = max_dimension or max(
-            800,
-            int(os.getenv("OVERLAY_MAX_DIMENSION", "1600")),
-        )
+        configured_max = int(os.getenv("OVERLAY_MAX_DIMENSION", "0"))
+        self.max_dimension = max(0, configured_max if max_dimension is None else max_dimension)
         self.jpeg_quality = min(
             95,
-            max(70, int(os.getenv("OVERLAY_JPEG_QUALITY", "88"))),
+            max(70, int(os.getenv("OVERLAY_JPEG_QUALITY", "91"))),
         )
 
     def compose(self, image_path: str | Path, text: str, output_path: str | Path) -> str:
@@ -32,7 +30,8 @@ class ImageTextComposer:
         with Image.open(source) as opened:
             image = ImageOps.exif_transpose(opened).convert("RGBA")
 
-        image.thumbnail((self.max_dimension, self.max_dimension), Image.Resampling.LANCZOS)
+        if self.max_dimension > 0:
+            image.thumbnail((self.max_dimension, self.max_dimension), Image.Resampling.LANCZOS)
         width, height = image.size
         if width < 120 or height < 120:
             raise ValueError("照片尺寸太小，無法清楚放上文字。")
