@@ -428,7 +428,7 @@ class ServiceRegressionTests(unittest.TestCase):
             return_value=(source.read_bytes(), "image/jpeg"),
         ), patch.object(
             self.service,
-            "_push_image_message",
+            "_reply_image_message",
             return_value=True,
         ), patch.object(self.service, "_reply_line_message", return_value=True), patch.object(
             self.service, "_push_line_overlay_choice", return_value=True
@@ -449,7 +449,7 @@ class ServiceRegressionTests(unittest.TestCase):
             )
             self.wait_for_overlay_job("choice-user")
 
-        self.assertEqual("true", result["replies"][0]["ok"])
+        self.assertEqual([], result["replies"])
         choice_mock.assert_called_once()
         recipient, choice_text = choice_mock.call_args.args
         self.assertEqual("choice-user", recipient)
@@ -461,6 +461,53 @@ class ServiceRegressionTests(unittest.TestCase):
         actions = [item["action"] for item in message["quickReply"]["items"]]
         self.assertEqual(["繼續貼字", "回到行程模式"], [action["label"] for action in actions])
         self.assertEqual(["繼續貼字", "回到行程模式"], [action["text"] for action in actions])
+
+    def test_new_overlay_image_uses_free_reply_token_for_finished_product(self) -> None:
+        sender_id = "automatic-free-reply-user"
+        self.service._handle_line_text(sender_id, "user", "加字模式")
+        self.service._handle_line_text(sender_id, "user", "免費自動回傳")
+        source = self.tempdir / "automatic-reply-source.jpg"
+        Image.new("RGB", (900, 600), (20, 100, 180)).save(source)
+        payload = {
+            "events": [
+                {
+                    "type": "message",
+                    "replyToken": "product-reply-token",
+                    "timestamp": 5_000,
+                    "webhookEventId": "automatic-image-event",
+                    "source": {"type": "user", "userId": sender_id},
+                    "message": {"type": "image", "id": "automatic-image"},
+                }
+            ]
+        }
+
+        with patch.object(
+            self.service,
+            "_download_line_message_content",
+            return_value=(source.read_bytes(), "image/jpeg"),
+        ), patch.object(
+            self.service,
+            "_reply_image_message",
+            return_value=True,
+        ) as reply_image_mock, patch.object(
+            self.service,
+            "_push_image_message",
+            return_value=False,
+        ) as push_image_mock, patch.object(
+            self.service,
+            "_push_line_overlay_choice",
+            return_value=False,
+        ):
+            result = self.service.ingest_webhook(payload)
+            self.wait_for_overlay_job(sender_id)
+
+        self.assertEqual([], result["replies"])
+        reply_image_mock.assert_called_once()
+        self.assertEqual("product-reply-token", reply_image_mock.call_args.args[0])
+        push_image_mock.assert_not_called()
+        session = self.service.overlay_store.get(sender_id)
+        self.assertEqual(1, session.completed_count)
+        self.assertEqual([], session.pending_outputs)
 
     def test_schedule_mode_choice_resets_all_overlay_records(self) -> None:
         self.service._handle_line_text("reset-user", "user", "加字模式")

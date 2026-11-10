@@ -35,6 +35,7 @@ class LineMVPService:
     APPLYING_MARKER = "[APPLYING]"
     FUNCTION_MENU_SENTINEL = "__LINE_FUNCTION_MENU__"
     OVERLAY_COMPLETE_SENTINEL = "__LINE_OVERLAY_COMPLETE__\n"
+    DEFERRED_OVERLAY_REPLY_SENTINEL = "__LINE_DEFERRED_OVERLAY_REPLY__"
     OVERLAY_COMMANDS = {
         "overlay_start",
         "overlay_continue",
@@ -102,13 +103,15 @@ class LineMVPService:
             if event_type != "message":
                 continue
 
-            message = event.get("message", {})
+            message = dict(event.get("message", {}))
             source = event.get("source", {})
             sender_id = source.get("userId") or source.get("groupId") or "unknown"
             source_type = source.get("type", "unknown")
             message_type = message.get("type", "")
             raw_text = message.get("text", "").strip() if message_type == "text" else ""
             reply_token = event.get("replyToken", "")
+            if reply_token:
+                message["_replyToken"] = reply_token
 
             if message_type == "text" and reply_token:
                 command, _code = self._parse_line_command(raw_text)
@@ -130,6 +133,8 @@ class LineMVPService:
             )
             if reply_text:
                 success = False
+                if reply_text == self.DEFERRED_OVERLAY_REPLY_SENTINEL:
+                    continue
                 if reply_text == self.FUNCTION_MENU_SENTINEL:
                     if reply_token:
                         success = self._reply_line_function_menu(reply_token)
@@ -458,6 +463,7 @@ class LineMVPService:
         event_id: str = "",
     ) -> str:
         message_id = message.get("id", "")
+        reply_token = str(message.get("_replyToken", ""))
         if not message_id:
             return "沒有收到可下載的 LINE 附件編號。"
 
@@ -493,6 +499,7 @@ class LineMVPService:
                     "event_timestamp": str(event_timestamp or ""),
                     "message_id": str(message_id),
                     "event_id": event_id,
+                    "reply_token": reply_token,
                 }
             )
             if event_id:
@@ -509,11 +516,15 @@ class LineMVPService:
             self.overlay_store.update(overlay_session)
             if auto_started:
                 self._start_overlay_batch_job(sender_id)
+                if reply_token:
+                    return self.DEFERRED_OVERLAY_REPLY_SENTINEL
                 return (
                     f"照片已收齊：{received}/{expected} 張。\n"
                     "已依 LINE 傳送時間排序並開始安全批次合成。\n"
                     "系統會逐張回傳；可輸入「加字狀態」查看進度。"
                 )
+            if reply_token:
+                return self.DEFERRED_OVERLAY_REPLY_SENTINEL
             return (
                 f"照片已安全保存：{received}/{expected} 張。\n"
                 "請繼續依序傳照片；若只想先處理目前照片，可輸入「開始合成」。"
@@ -1344,6 +1355,7 @@ class LineMVPService:
                             sender_id,
                             session,
                             Path(image_part["path"]),
+                            reply_token=str(image_part.get("reply_token", "")),
                         )
                     except Exception:
                         session.image_queue.insert(0, image_part)
@@ -1425,6 +1437,7 @@ class LineMVPService:
         sender_id: str,
         session: OverlaySession,
         image_path: Path,
+        reply_token: str = "",
     ) -> str:
         expired = self._prune_overlay_texts(session)
         if not session.text_queue:
@@ -1460,7 +1473,11 @@ class LineMVPService:
         session.output_path = result_path
         session.updated_at = self._now_iso()
         session.last_error = ""
-        pushed = self._push_image_message(sender_id, result_path)
+        pushed = False
+        if reply_token:
+            pushed = self._reply_image_message(reply_token, result_path)
+        if not pushed:
+            pushed = self._push_image_message(sender_id, result_path)
         if not pushed:
             if result_path not in session.pending_outputs:
                 session.pending_outputs.append(result_path)
@@ -1581,6 +1598,44 @@ class LineMVPService:
             },
         )
         return self._send_line_request(fallback_req, timeout=12, retries=2)
+
+    def _reply_image_message(self, reply_token: str, image_path: str) -> bool:
+        token = os.getenv("LINE_CHANNEL_ACCESS_TOKEN", "").strip()
+        base_url = self.public_base_url()
+        image_url = self._public_output_url(image_path, base_url)
+        if not token or not reply_token or not image_url:
+            self._set_line_request_error(
+                "缺少 LINE 權杖、回覆權杖或有效的公開成品網址"
+            )
+            return False
+
+        source_path = Path(image_path)
+        preview_path = source_path.with_name(f"{source_path.stem}_line_preview.jpg")
+        try:
+            self.image_text_composer.create_preview(source_path, preview_path)
+        except Exception as exc:
+            self._set_line_request_error(f"建立 LINE 預覽圖失敗：{exc}")
+            return False
+        preview_url = self._public_output_url(str(preview_path), base_url)
+        if not preview_url:
+            self._set_line_request_error("無法建立 LINE 預覽圖的公開網址")
+            return False
+
+        req = self._make_line_request(
+            "https://api.line.me/v2/bot/message/reply",
+            token,
+            {
+                "replyToken": reply_token,
+                "messages": [
+                    {
+                        "type": "image",
+                        "originalContentUrl": image_url,
+                        "previewImageUrl": preview_url,
+                    }
+                ],
+            },
+        )
+        return self._send_line_request(req, timeout=12, retries=1)
 
     def _push_apply_assets(self, to: str, item: InboxMessage) -> bool:
         token = os.getenv("LINE_CHANNEL_ACCESS_TOKEN", "").strip()
