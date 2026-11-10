@@ -152,6 +152,8 @@ https://你的服務網址/webhook/line
 - 輸入 `取消加字` 會清空未配對文字並返回行程模式
 - 配對時間可用 `OVERLAY_PAIR_SECONDS` 調整，預設為 `1800` 秒
 - 照片與文字數量相同時會立即處理；尚未收齊時的排序等待可用 `OVERLAY_IMAGE_SETTLE_SECONDS` 調整，預設為 `0.6` 秒
+- LINE 合成圖預設縮放至最長邊 `1600px`、JPEG 品質 `88`，可用 `OVERLAY_MAX_DIMENSION` 與 `OVERLAY_JPEG_QUALITY` 調整
+- 圖片推送失敗會保留成品等待補送；單次快速重試次數可用 `OVERLAY_LINE_PUSH_RETRIES` 調整，預設為 `2`
 - 專案已內建 Noto Sans TC 與 Noto Sans SC，會依文字自動支援繁體、簡體及兩者混用；如需改用其他字型，可用 `OVERLAY_FONT_PATH` 指定 `.ttf` 或 `.ttc`
 
 功能選單說明：

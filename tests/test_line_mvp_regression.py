@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import shutil
 import tempfile
+import threading
 import time
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
 from unittest.mock import patch
@@ -504,6 +506,81 @@ class ServiceRegressionTests(unittest.TestCase):
         text_mock.assert_called_once()
         choice_mock.assert_not_called()
 
+    def test_overlay_images_download_concurrently_before_ordered_queueing(self) -> None:
+        self.service._handle_line_text("parallel-user", "user", "加字模式")
+        self.service._handle_line_text("parallel-user", "user", "第一段")
+        self.service._handle_line_text("parallel-user", "user", "第二段")
+        downloads_met = threading.Barrier(2)
+
+        def fake_download(message_id: str) -> tuple[bytes, str]:
+            downloads_met.wait(timeout=1)
+            return f"image-{message_id}".encode("ascii"), "image/jpeg"
+
+        with patch.object(
+            self.service,
+            "_download_line_message_content",
+            side_effect=fake_download,
+        ), patch.object(self.service, "_start_overlay_batch_job", return_value=None):
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                futures = [
+                    executor.submit(
+                        self.service._handle_line_attachment,
+                        "parallel-user",
+                        "user",
+                        {"id": "202", "type": "image"},
+                        2_000,
+                        "parallel-image-2",
+                    ),
+                    executor.submit(
+                        self.service._handle_line_attachment,
+                        "parallel-user",
+                        "user",
+                        {"id": "201", "type": "image"},
+                        1_000,
+                        "parallel-image-1",
+                    ),
+                ]
+                replies = [future.result(timeout=2) for future in futures]
+
+        self.assertTrue(all("照片" in reply for reply in replies))
+        session = self.service.overlay_store.get("parallel-user")
+        self.assertEqual(
+            ["201", "202"],
+            [part["message_id"] for part in session.image_queue],
+        )
+
+    def test_current_overlay_image_is_pushed_before_old_pending_output(self) -> None:
+        self.service._handle_line_text("priority-user", "user", "加字模式")
+        self.service._handle_line_text("priority-user", "user", "新圖片")
+        session = self.service.overlay_store.get("priority-user")
+        session.pending_outputs = ["old-1.jpg", "old-2.jpg"]
+        self.service.overlay_store.update(session)
+        pushed: list[str] = []
+
+        def fake_compose(image_path: str, text: str, output_path: Path) -> str:
+            Path(output_path).write_bytes(b"generated-jpeg")
+            return str(output_path)
+
+        def fake_push(sender_id: str, output_path: str) -> bool:
+            pushed.append(output_path)
+            return True
+
+        with patch.object(
+            self.service.image_text_composer,
+            "compose",
+            side_effect=fake_compose,
+        ), patch.object(self.service, "_push_image_message", side_effect=fake_push):
+            self.service._create_overlay_from_image(
+                "priority-user",
+                session,
+                self.tempdir / "source.jpg",
+            )
+
+        self.assertIn("line_overlay_", Path(pushed[0]).name)
+        self.assertEqual("old-1.jpg", pushed[1])
+        updated = self.service.overlay_store.get("priority-user")
+        self.assertEqual(["old-2.jpg"], updated.pending_outputs)
+
     def test_complete_overlay_batch_skips_settle_delay(self) -> None:
         self.service.overlay_image_settle_seconds = 2.0
         self.service._handle_line_text("fast-user", "user", "加字模式")
@@ -749,6 +826,16 @@ class ImageTextComposerTests(unittest.TestCase):
             dark_pixels = sum(count for count, color in colors if max(color) < 45)
             pixel_count = upper_center.width * upper_center.height
             self.assertLess(dark_pixels / pixel_count, 0.16)
+
+    def test_default_line_image_is_limited_for_fast_delivery(self) -> None:
+        source = self.tempdir / "large-source.jpg"
+        output = self.tempdir / "large-result.jpg"
+        Image.new("RGB", (3200, 2400), (70, 110, 150)).save(source, quality=95)
+
+        ImageTextComposer().compose(source, "快速回傳", output)
+
+        with Image.open(output) as result:
+            self.assertLessEqual(max(result.size), 1600)
 
     def test_bundled_font_contains_distinct_traditional_chinese_glyphs(self) -> None:
         font = ImageTextComposer._load_font(72)

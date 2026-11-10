@@ -7,8 +7,15 @@ from PIL import Image, ImageDraw, ImageFont, ImageOps
 
 
 class ImageTextComposer:
-    def __init__(self, max_dimension: int = 2048):
-        self.max_dimension = max_dimension
+    def __init__(self, max_dimension: int | None = None):
+        self.max_dimension = max_dimension or max(
+            800,
+            int(os.getenv("OVERLAY_MAX_DIMENSION", "1600")),
+        )
+        self.jpeg_quality = min(
+            95,
+            max(70, int(os.getenv("OVERLAY_JPEG_QUALITY", "88"))),
+        )
 
     def compose(self, image_path: str | Path, text: str, output_path: str | Path) -> str:
         caption = text.strip()
@@ -51,7 +58,13 @@ class ImageTextComposer:
         )
 
         result = Image.alpha_composite(image, overlay).convert("RGB")
-        result.save(output, format="JPEG", quality=91, optimize=True, progressive=True)
+        result.save(
+            output,
+            format="JPEG",
+            quality=self.jpeg_quality,
+            optimize=False,
+            progressive=True,
+        )
         return str(output)
 
     def _fit_text(
