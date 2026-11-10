@@ -54,6 +54,10 @@ class InboxMessage:
     overlay_image_path: str = ""
     overlay_image_at: str = ""
     overlay_output_path: str = ""
+    overlay_text_queue: list[dict[str, str]] = field(default_factory=list)
+    overlay_image_queue: list[dict[str, str]] = field(default_factory=list)
+    overlay_pending_outputs: list[str] = field(default_factory=list)
+    overlay_completed_count: int = 0
 
 
 @dataclass(slots=True)

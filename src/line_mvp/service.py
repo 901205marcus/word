@@ -50,6 +50,8 @@ class LineMVPService:
 
         self._job_lock = threading.Lock()
         self._active_jobs: set[str] = set()
+        self._sender_locks_guard = threading.Lock()
+        self._sender_locks: dict[str, threading.RLock] = {}
 
     def verify_signature(self, body: bytes, signature: str) -> bool:
         secret = os.getenv("LINE_CHANNEL_SECRET", "").strip()
@@ -188,6 +190,10 @@ class LineMVPService:
         return "目前只支援文字、圖片與檔案訊息。"
 
     def _handle_line_text(self, sender_id: str, source_type: str, raw_text: str) -> str:
+        with self._sender_lock(sender_id):
+            return self._handle_line_text_locked(sender_id, source_type, raw_text)
+
+    def _handle_line_text_locked(self, sender_id: str, source_type: str, raw_text: str) -> str:
         command, code = self._parse_line_command(raw_text)
         if command:
             return self._execute_line_command(sender_id, command, code)
@@ -199,8 +205,7 @@ class LineMVPService:
             item.raw_text = self._merge_text(item.raw_text, raw_text)
             item.last_progress_at = self._now_iso()
 
-        item.overlay_text = raw_text
-        item.overlay_text_at = self._now_iso()
+        self._enqueue_overlay_text(item, raw_text)
         item.actions = self._enrich_actions(self.parser.parse(item.raw_text))
         item.error = ""
         item.last_error = ""
@@ -211,6 +216,15 @@ class LineMVPService:
         return self._format_created_reply(item)
 
     def _handle_line_attachment(self, sender_id: str, source_type: str, message: dict[str, Any]) -> str:
+        with self._sender_lock(sender_id):
+            return self._handle_line_attachment_locked(sender_id, source_type, message)
+
+    def _handle_line_attachment_locked(
+        self,
+        sender_id: str,
+        source_type: str,
+        message: dict[str, Any],
+    ) -> str:
         message_id = message.get("id", "")
         if not message_id:
             return "沒有收到可下載的 LINE 附件編號。"
@@ -230,8 +244,7 @@ class LineMVPService:
         item.last_progress_at = self._now_iso()
 
         if message.get("type") == "image":
-            item.overlay_image_path = str(saved_path)
-            item.overlay_image_at = self._now_iso()
+            self._enqueue_overlay_image(item, str(saved_path))
             self.store.update_message(item)
             overlay_reply = self._try_create_overlay(sender_id, item)
             if overlay_reply:
@@ -251,7 +264,11 @@ class LineMVPService:
             item.last_error = str(exc)
             self.store.update_message(item)
             if message.get("type") == "image":
-                return "圖片已收到。請在 10 分鐘內再傳送要放在照片中央的文字。"
+                waiting = len(item.overlay_image_queue)
+                return (
+                    "圖片已收到，請在 10 分鐘內傳送這張照片的文字。\n"
+                    f"目前待配對照片：{waiting} 張。"
+                )
             return f"附件已收到，但文字辨識失敗：{saved_path.name}\n錯誤：{exc}"
 
         item.raw_text = self._merge_text(item.raw_text, f"[附件：{saved_path.name}]\n{extracted}")
@@ -497,54 +514,123 @@ class LineMVPService:
         )
         return self._send_line_request(req, timeout=15, retries=self.line_push_retries)
 
-    def _try_create_overlay(self, sender_id: str, item: InboxMessage) -> str:
-        if not item.overlay_text.strip() or not item.overlay_image_path.strip():
-            return ""
+    def _sender_lock(self, sender_id: str) -> threading.RLock:
+        with self._sender_locks_guard:
+            return self._sender_locks.setdefault(sender_id, threading.RLock())
 
-        try:
-            text_time = datetime.fromisoformat(item.overlay_text_at)
-            image_time = datetime.fromisoformat(item.overlay_image_at)
-        except (TypeError, ValueError):
-            return ""
+    def _enqueue_overlay_text(self, item: InboxMessage, text: str) -> None:
+        self._migrate_overlay_queue(item)
+        item.overlay_text_queue.append({"text": text, "at": self._now_iso()})
+        self._sync_overlay_legacy_fields(item)
 
-        if abs((text_time - image_time).total_seconds()) > self.overlay_pair_seconds:
-            if text_time > image_time:
-                item.overlay_image_path = ""
-                item.overlay_image_at = ""
-            else:
-                item.overlay_text = ""
-                item.overlay_text_at = ""
-            self.store.update_message(item)
-            return ""
+    def _enqueue_overlay_image(self, item: InboxMessage, image_path: str) -> None:
+        self._migrate_overlay_queue(item)
+        item.overlay_image_queue.append({"path": image_path, "at": self._now_iso()})
+        self._sync_overlay_legacy_fields(item)
 
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-        output_path = self.output_dir / f"line_overlay_{self._message_code(item).lower()}_{timestamp}.jpg"
-        try:
-            result_path = self.image_text_composer.compose(
-                item.overlay_image_path,
-                item.overlay_text,
-                output_path,
+    def _migrate_overlay_queue(self, item: InboxMessage) -> None:
+        if not item.overlay_text_queue and item.overlay_text.strip():
+            item.overlay_text_queue.append(
+                {"text": item.overlay_text, "at": item.overlay_text_at or self._now_iso()}
             )
-        except Exception as exc:
-            item.last_error = f"圖片文字合成失敗：{exc}"
+        if not item.overlay_image_queue and item.overlay_image_path.strip():
+            item.overlay_image_queue.append(
+                {"path": item.overlay_image_path, "at": item.overlay_image_at or self._now_iso()}
+            )
+
+    @staticmethod
+    def _sync_overlay_legacy_fields(item: InboxMessage) -> None:
+        first_text = item.overlay_text_queue[0] if item.overlay_text_queue else {}
+        first_image = item.overlay_image_queue[0] if item.overlay_image_queue else {}
+        item.overlay_text = first_text.get("text", "")
+        item.overlay_text_at = first_text.get("at", "")
+        item.overlay_image_path = first_image.get("path", "")
+        item.overlay_image_at = first_image.get("at", "")
+
+    def _try_create_overlay(self, sender_id: str, item: InboxMessage) -> str:
+        self._migrate_overlay_queue(item)
+        delivered = self._retry_overlay_outputs(sender_id, item)
+        completed = 0
+        expired = 0
+        errors: list[str] = []
+
+        while item.overlay_text_queue and item.overlay_image_queue:
+            text_part = item.overlay_text_queue[0]
+            image_part = item.overlay_image_queue[0]
+            try:
+                text_time = datetime.fromisoformat(text_part["at"])
+                image_time = datetime.fromisoformat(image_part["at"])
+            except (KeyError, TypeError, ValueError):
+                item.overlay_text_queue.pop(0)
+                item.overlay_image_queue.pop(0)
+                expired += 1
+                continue
+
+            delta = (text_time - image_time).total_seconds()
+            if abs(delta) > self.overlay_pair_seconds:
+                if delta > 0:
+                    item.overlay_image_queue.pop(0)
+                else:
+                    item.overlay_text_queue.pop(0)
+                expired += 1
+                continue
+
+            # Consume both inputs before rendering so neither can be reused by a later pair.
+            item.overlay_text_queue.pop(0)
+            item.overlay_image_queue.pop(0)
+            pair_number = item.overlay_completed_count + 1
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+            output_path = self.output_dir / (
+                f"line_overlay_{self._message_code(item).lower()}_{pair_number:04d}_{timestamp}.jpg"
+            )
+            try:
+                result_path = self.image_text_composer.compose(
+                    image_part["path"],
+                    text_part["text"],
+                    output_path,
+                )
+            except Exception as exc:
+                errors.append(f"第 {pair_number} 組合成失敗：{exc}")
+                continue
+
+            item.overlay_output_path = result_path
+            item.overlay_completed_count = pair_number
             item.last_progress_at = self._now_iso()
-            self.store.update_message(item)
-            return f"圖片文字合成失敗：{exc}"
+            if self._push_image_message(sender_id, result_path):
+                completed += 1
+            else:
+                item.overlay_pending_outputs.append(result_path)
+                errors.append(f"第 {pair_number} 組已完成，等待 LINE 自動重送")
 
-        item.overlay_output_path = result_path
-        item.last_progress_at = self._now_iso()
-        if not self._push_image_message(sender_id, result_path):
-            item.last_error = "圖片已合成，但 LINE 圖片回傳失敗。"
-            self.store.update_message(item)
-            return "圖片已合成，但 LINE 回傳失敗；系統會保留照片與文字，請再傳一次文字重試。"
-
-        item.overlay_text = ""
-        item.overlay_text_at = ""
-        item.overlay_image_path = ""
-        item.overlay_image_at = ""
-        item.last_error = ""
+        self._sync_overlay_legacy_fields(item)
+        item.last_error = "\n".join(errors)
         self.store.update_message(item)
-        return "圖片文字合成完成，已把大字置中後回傳。"
+
+        messages: list[str] = []
+        if completed:
+            messages.append(f"一對一圖片合成完成：{completed} 組，已依順序回傳。")
+        if delivered:
+            messages.append(f"先前待回傳圖片已補送：{delivered} 張。")
+        if expired:
+            messages.append(f"已略過 {expired} 筆超過配對時間的資料。")
+        if errors:
+            messages.extend(errors)
+        if messages:
+            messages.append(
+                f"待配對：照片 {len(item.overlay_image_queue)} 張、文字 {len(item.overlay_text_queue)} 筆。"
+            )
+        return "\n".join(messages)
+
+    def _retry_overlay_outputs(self, sender_id: str, item: InboxMessage) -> int:
+        delivered = 0
+        still_pending: list[str] = []
+        for output_path in item.overlay_pending_outputs:
+            if self._push_image_message(sender_id, output_path):
+                delivered += 1
+            else:
+                still_pending.append(output_path)
+        item.overlay_pending_outputs = still_pending
+        return delivered
 
     def _push_image_message(self, to: str, image_path: str) -> bool:
         token = os.getenv("LINE_CHANNEL_ACCESS_TOKEN", "").strip()

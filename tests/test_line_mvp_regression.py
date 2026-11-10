@@ -250,6 +250,87 @@ class ServiceRegressionTests(unittest.TestCase):
         item = self.service.store.find_message("user-2")
         self.assertTrue(Path(item.overlay_output_path).exists())
 
+    def test_twenty_overlay_pairs_stay_one_to_one_in_order(self) -> None:
+        composed: list[tuple[bytes, str]] = []
+
+        def fake_compose(image_path: str, text: str, output_path: Path) -> str:
+            composed.append((Path(image_path).read_bytes(), text))
+            Path(output_path).write_bytes(b"generated-jpeg")
+            return str(output_path)
+
+        with patch.object(
+            self.service.attachment_reader,
+            "extract_text",
+            side_effect=ValueError("no ocr"),
+        ), patch.object(
+            self.service.image_text_composer,
+            "compose",
+            side_effect=fake_compose,
+        ), patch.object(self.service, "_push_image_message", return_value=True):
+            for index in range(20):
+                image_bytes = f"unique-image-{index}".encode("ascii")
+                with patch.object(
+                    self.service,
+                    "_download_line_message_content",
+                    return_value=(image_bytes, "image/jpeg"),
+                ):
+                    self.service._handle_line_attachment(
+                        "bulk-user",
+                        "user",
+                        {"id": f"image-{index}", "type": "image"},
+                    )
+                self.service._handle_line_text(
+                    "bulk-user",
+                    "user",
+                    f"第 {index + 1} 張照片的文字",
+                )
+
+        expected = [
+            (f"unique-image-{index}".encode("ascii"), f"第 {index + 1} 張照片的文字")
+            for index in range(20)
+        ]
+        self.assertEqual(expected, composed)
+        item = self.service.store.find_message("bulk-user")
+        self.assertEqual(20, item.overlay_completed_count)
+        self.assertEqual([], item.overlay_image_queue)
+        self.assertEqual([], item.overlay_text_queue)
+
+    def test_overlay_fifo_queues_never_overwrite_same_type(self) -> None:
+        composed: list[tuple[bytes, str]] = []
+
+        def fake_compose(image_path: str, text: str, output_path: Path) -> str:
+            composed.append((Path(image_path).read_bytes(), text))
+            Path(output_path).write_bytes(b"generated-jpeg")
+            return str(output_path)
+
+        with patch.object(
+            self.service.attachment_reader,
+            "extract_text",
+            side_effect=ValueError("no ocr"),
+        ), patch.object(
+            self.service.image_text_composer,
+            "compose",
+            side_effect=fake_compose,
+        ), patch.object(self.service, "_push_image_message", return_value=True):
+            for index in range(2):
+                with patch.object(
+                    self.service,
+                    "_download_line_message_content",
+                    return_value=(f"image-{index}".encode("ascii"), "image/jpeg"),
+                ):
+                    self.service._handle_line_attachment(
+                        "fifo-user",
+                        "user",
+                        {"id": f"fifo-{index}", "type": "image"},
+                    )
+            self.service._handle_line_text("fifo-user", "user", "第一段")
+            self.service._handle_line_text("fifo-user", "user", "第二段")
+
+        self.assertEqual(
+            [(b"image-0", "第一段"), (b"image-1", "第二段")],
+            composed,
+        )
+
 
 class ImageTextComposerTests(unittest.TestCase):
     def setUp(self) -> None:

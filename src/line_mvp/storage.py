@@ -123,4 +123,8 @@ class InboxStore:
             overlay_image_path=item.get("overlay_image_path", ""),
             overlay_image_at=item.get("overlay_image_at", ""),
             overlay_output_path=item.get("overlay_output_path", ""),
+            overlay_text_queue=list(item.get("overlay_text_queue", [])),
+            overlay_image_queue=list(item.get("overlay_image_queue", [])),
+            overlay_pending_outputs=list(item.get("overlay_pending_outputs", [])),
+            overlay_completed_count=int(item.get("overlay_completed_count", 0)),
         )
