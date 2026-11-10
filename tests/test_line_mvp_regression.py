@@ -140,6 +140,7 @@ class ServiceRegressionTests(unittest.TestCase):
         (self.tempdir / "data" / "line_mvp").mkdir(parents=True, exist_ok=True)
         (self.tempdir / "outputs").mkdir(parents=True, exist_ok=True)
         self.service = LineMVPService(self.tempdir)
+        self.service.overlay_image_settle_seconds = 0.05
 
     def tearDown(self) -> None:
         deadline = time.monotonic() + 5
@@ -304,7 +305,7 @@ class ServiceRegressionTests(unittest.TestCase):
             )
             self.wait_for_overlay_job("user-1")
 
-        self.assertIn("已開始背景批次處理", reply)
+        self.assertIn("立即在背景處理", reply)
         session = self.service.overlay_store.get("user-1")
         self.assertTrue(session.active)
         self.assertTrue(Path(session.output_path).exists())
@@ -457,9 +458,51 @@ class ServiceRegressionTests(unittest.TestCase):
             [(b"earlier-image", "第一段"), (b"later-image", "第二段")],
             composed,
         )
-        self.assertIn("照片已收到：1/2", first_reply)
-        self.assertIn("照片已收齊：2/2", final_reply)
+        self.assertIn("目前佇列 1 張", first_reply)
+        self.assertIn("目前佇列 2 張", final_reply)
         choice_mock.assert_called_once()
+
+    def test_partial_overlay_batch_processes_without_waiting_for_all_images(self) -> None:
+        composed: list[str] = []
+
+        def fake_compose(image_path: str, text: str, output_path: Path) -> str:
+            composed.append(text)
+            Path(output_path).write_bytes(b"generated-jpeg")
+            return str(output_path)
+
+        self.service._handle_line_text("partial-user", "user", "加字模式")
+        self.service._handle_line_text("partial-user", "user", "第一段")
+        self.service._handle_line_text("partial-user", "user", "第二段")
+
+        with patch.object(
+            self.service,
+            "_download_line_message_content",
+            return_value=(b"only-one-image", "image/jpeg"),
+        ), patch.object(
+            self.service.image_text_composer,
+            "compose",
+            side_effect=fake_compose,
+        ), patch.object(self.service, "_push_image_message", return_value=True), patch.object(
+            self.service, "_push_text_message", return_value=True
+        ) as text_mock, patch.object(
+            self.service, "_push_line_overlay_choice", return_value=True
+        ) as choice_mock:
+            reply = self.service._handle_line_attachment(
+                "partial-user",
+                "user",
+                {"id": "image-1", "type": "image"},
+                event_timestamp=1_000,
+                event_id="partial-image-event",
+            )
+            self.wait_for_overlay_job("partial-user")
+
+        self.assertIn("不必等全部照片傳完", reply)
+        self.assertEqual(["第一段"], composed)
+        session = self.service.overlay_store.get("partial-user")
+        self.assertEqual(["第二段"], [part["text"] for part in session.text_queue])
+        self.assertEqual([], session.image_queue)
+        text_mock.assert_called_once()
+        choice_mock.assert_not_called()
 
     def test_overlay_image_redelivery_is_not_queued_twice(self) -> None:
         self.service._handle_line_text("image-duplicate-user", "user", "加字模式")
@@ -470,7 +513,9 @@ class ServiceRegressionTests(unittest.TestCase):
             self.service,
             "_download_line_message_content",
             return_value=(b"image", "image/jpeg"),
-        ) as download_mock:
+        ) as download_mock, patch.object(
+            self.service, "_start_overlay_batch_job", return_value=None
+        ):
             first = self.service._handle_line_attachment(
                 "image-duplicate-user",
                 "user",
@@ -486,7 +531,7 @@ class ServiceRegressionTests(unittest.TestCase):
                 event_id="same-image-event",
             )
 
-        self.assertIn("照片已收到：1/2", first)
+        self.assertIn("目前佇列 1 張", first)
         self.assertIn("不會重複加入", duplicate)
         self.assertEqual(1, download_mock.call_count)
         session = self.service.overlay_store.get("image-duplicate-user")
@@ -550,7 +595,7 @@ class ServiceRegressionTests(unittest.TestCase):
                 {"id": "image-2-retry", "type": "image"},
             )
             self.wait_for_overlay_job("user-2")
-        self.assertIn("已開始背景批次處理", reply)
+        self.assertIn("立即在背景處理", reply)
 
     def test_twenty_batched_texts_then_images_stay_one_to_one_in_order(self) -> None:
         composed: list[tuple[bytes, str]] = []
