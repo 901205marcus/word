@@ -153,7 +153,8 @@ https://你的服務網址/webhook/line
 - 配對時間可用 `OVERLAY_PAIR_SECONDS` 調整，預設為 `1800` 秒
 - 照片與文字數量相同時會立即處理；尚未收齊時的排序等待可用 `OVERLAY_IMAGE_SETTLE_SECONDS` 調整，預設為 `0.6` 秒
 - LINE 合成圖預設保留原照片像素尺寸，JPEG 品質為 `91`；只有設定正整數 `OVERLAY_MAX_DIMENSION` 時才會限制最長邊，`0` 代表不縮放
-- 圖片推送失敗會保留成品等待補送；單次快速重試次數可用 `OVERLAY_LINE_PUSH_RETRIES` 調整，預設為 `2`
+- 為符合 LINE 圖片容量限制，檔案超過 `OVERLAY_MAX_OUTPUT_MB`（預設 `9MB`）時只會逐步調整 JPEG 品質，不會改變照片寬高
+- 圖片推送失敗會保留成品並在背景自動補送；單次快速嘗試預設為 `1` 次，背景重試間隔與次數可用 `OVERLAY_RETRY_DELAY`、`OVERLAY_RETRY_ATTEMPTS` 調整
 - 專案已內建 Noto Sans TC 與 Noto Sans SC，會依文字自動支援繁體、簡體及兩者混用；如需改用其他字型，可用 `OVERLAY_FONT_PATH` 指定 `.ttf` 或 `.ttc`
 
 功能選單說明：

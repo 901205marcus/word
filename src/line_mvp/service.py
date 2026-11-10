@@ -71,7 +71,15 @@ class LineMVPService:
         self.line_push_retries = max(1, int(os.getenv("LINE_PUSH_RETRIES", "5")))
         self.overlay_push_retries = max(
             1,
-            int(os.getenv("OVERLAY_LINE_PUSH_RETRIES", "2")),
+            int(os.getenv("OVERLAY_LINE_PUSH_RETRIES", "1")),
+        )
+        self.overlay_retry_delay = max(
+            2,
+            int(os.getenv("OVERLAY_RETRY_DELAY", "5")),
+        )
+        self.overlay_retry_attempts = max(
+            1,
+            int(os.getenv("OVERLAY_RETRY_ATTEMPTS", "12")),
         )
 
         self._job_lock = threading.Lock()
@@ -80,6 +88,8 @@ class LineMVPService:
         self._sender_locks: dict[str, threading.RLock] = {}
         self._overlay_job_lock = threading.Lock()
         self._active_overlay_jobs: set[str] = set()
+        self._overlay_retry_lock = threading.Lock()
+        self._active_overlay_retry_jobs: set[str] = set()
 
     def verify_signature(self, body: bytes, signature: str) -> bool:
         secret = os.getenv("LINE_CHANNEL_SECRET", "").strip()
@@ -250,10 +260,15 @@ class LineMVPService:
     def recover_overlay_jobs(self) -> int:
         recovered = 0
         for session in self.overlay_store.list_sessions():
-            if not session.active or not session.text_queue or not session.image_queue:
-                continue
-            self._start_overlay_batch_job(session.sender_id)
-            recovered += 1
+            started = False
+            if session.pending_outputs:
+                self._start_overlay_output_retry_job(session.sender_id)
+                started = True
+            if session.active and session.text_queue and session.image_queue:
+                self._start_overlay_batch_job(session.sender_id)
+                started = True
+            if started:
+                recovered += 1
         return recovered
 
     def _handle_line_event(
@@ -1189,11 +1204,15 @@ class LineMVPService:
             session.pending_outputs.append(result_path)
             session.last_error = f"第 {pair_number} 組已完成，等待 LINE 自動補送"
         self.overlay_store.update(session)
+        if not pushed:
+            self._start_overlay_output_retry_job(sender_id)
 
         delivered = 0
         if pushed and session.pending_outputs:
             delivered = self._retry_overlay_outputs(sender_id, session, limit=1)
             self.overlay_store.update(session)
+        if session.pending_outputs:
+            self._start_overlay_output_retry_job(sender_id)
         logger.info(
             "LINE overlay pair finished sender=%s pair=%d compose=%.3f push=%.3f total=%.3f pushed=%s",
             sender_key,
@@ -1222,6 +1241,49 @@ class LineMVPService:
 
         lines.append("本批尚未完成，請繼續傳下一張照片；全部處理完才會顯示模式選項。")
         return "\n".join(lines)
+
+    def _start_overlay_output_retry_job(self, sender_id: str) -> None:
+        with self._overlay_retry_lock:
+            if sender_id in self._active_overlay_retry_jobs:
+                return
+            self._active_overlay_retry_jobs.add(sender_id)
+
+        worker = threading.Thread(
+            target=self._run_overlay_output_retry_job,
+            args=(sender_id,),
+            daemon=False,
+            name=f"line-overlay-retry-{sha256(sender_id.encode('utf-8')).hexdigest()[:8]}",
+        )
+        worker.start()
+
+    def _run_overlay_output_retry_job(self, sender_id: str) -> None:
+        failed_attempts = 0
+        try:
+            while failed_attempts < self.overlay_retry_attempts:
+                session = self.overlay_store.get(sender_id)
+                if not session or not session.pending_outputs:
+                    return
+
+                delay = min(60, self.overlay_retry_delay * (2**failed_attempts))
+                time.sleep(delay)
+                with self._sender_lock(sender_id):
+                    session = self.overlay_store.get(sender_id)
+                    if not session or not session.pending_outputs:
+                        return
+                    delivered = self._retry_overlay_outputs(sender_id, session, limit=1)
+                    if delivered:
+                        failed_attempts = 0
+                        session.last_error = ""
+                    else:
+                        failed_attempts += 1
+                        session.last_error = (
+                            f"LINE 圖片補送第 {failed_attempts} 次失敗，系統仍會自動重試"
+                        )
+                    session.updated_at = self._now_iso()
+                    self.overlay_store.update(session)
+        finally:
+            with self._overlay_retry_lock:
+                self._active_overlay_retry_jobs.discard(sender_id)
 
     def _retry_overlay_outputs(
         self,

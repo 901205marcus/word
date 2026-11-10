@@ -146,7 +146,9 @@ class ServiceRegressionTests(unittest.TestCase):
 
     def tearDown(self) -> None:
         deadline = time.monotonic() + 5
-        while self.service._active_overlay_jobs and time.monotonic() < deadline:
+        while (
+            self.service._active_overlay_jobs or self.service._active_overlay_retry_jobs
+        ) and time.monotonic() < deadline:
             time.sleep(0.01)
         shutil.rmtree(self.tempdir, ignore_errors=True)
 
@@ -155,6 +157,15 @@ class ServiceRegressionTests(unittest.TestCase):
         while sender_id in self.service._active_overlay_jobs and time.monotonic() < deadline:
             time.sleep(0.01)
         self.assertNotIn(sender_id, self.service._active_overlay_jobs)
+
+    def wait_for_overlay_retry_job(self, sender_id: str, timeout: float = 5) -> None:
+        deadline = time.monotonic() + timeout
+        while (
+            sender_id in self.service._active_overlay_retry_jobs
+            and time.monotonic() < deadline
+        ):
+            time.sleep(0.01)
+        self.assertNotIn(sender_id, self.service._active_overlay_retry_jobs)
 
     def make_item(self) -> InboxMessage:
         item = self.service.store.add_message("user-1", "manual", "7/20 10:00 測試行程")
@@ -569,7 +580,9 @@ class ServiceRegressionTests(unittest.TestCase):
             self.service.image_text_composer,
             "compose",
             side_effect=fake_compose,
-        ), patch.object(self.service, "_push_image_message", side_effect=fake_push):
+        ), patch.object(
+            self.service, "_push_image_message", side_effect=fake_push
+        ), patch.object(self.service, "_start_overlay_output_retry_job", return_value=None):
             self.service._create_overlay_from_image(
                 "priority-user",
                 session,
@@ -580,6 +593,38 @@ class ServiceRegressionTests(unittest.TestCase):
         self.assertEqual("old-1.jpg", pushed[1])
         updated = self.service.overlay_store.get("priority-user")
         self.assertEqual(["old-2.jpg"], updated.pending_outputs)
+
+    def test_failed_overlay_push_retries_in_background_until_delivered(self) -> None:
+        self.service.overlay_retry_delay = 0.01
+        self.service.overlay_retry_attempts = 3
+        self.service._handle_line_text("retry-user", "user", "加字模式")
+        self.service._handle_line_text("retry-user", "user", "自動補送")
+        session = self.service.overlay_store.get("retry-user")
+        attempts = [False, True]
+
+        def fake_compose(image_path: str, text: str, output_path: Path) -> str:
+            Path(output_path).write_bytes(b"generated-jpeg")
+            return str(output_path)
+
+        with patch.object(
+            self.service.image_text_composer,
+            "compose",
+            side_effect=fake_compose,
+        ), patch.object(
+            self.service,
+            "_push_image_message",
+            side_effect=lambda *_args: attempts.pop(0),
+        ):
+            self.service._create_overlay_from_image(
+                "retry-user",
+                session,
+                self.tempdir / "source.jpg",
+            )
+            self.wait_for_overlay_retry_job("retry-user")
+
+        updated = self.service.overlay_store.get("retry-user")
+        self.assertEqual([], updated.pending_outputs)
+        self.assertEqual("", updated.last_error)
 
     def test_complete_overlay_batch_skips_settle_delay(self) -> None:
         self.service.overlay_image_settle_seconds = 2.0
@@ -846,6 +891,18 @@ class ImageTextComposerTests(unittest.TestCase):
 
         with Image.open(output) as result:
             self.assertEqual((1200, 900), result.size)
+
+    def test_output_size_limit_changes_quality_not_dimensions(self) -> None:
+        source = self.tempdir / "detailed-source.jpg"
+        output = self.tempdir / "detailed-result.jpg"
+        channels = [Image.effect_noise((1600, 1200), 100) for _ in range(3)]
+        Image.merge("RGB", channels).save(source, quality=95)
+
+        ImageTextComposer(max_output_bytes=1024 * 1024).compose(source, "容量測試", output)
+
+        with Image.open(output) as result:
+            self.assertEqual((1600, 1200), result.size)
+        self.assertLessEqual(output.stat().st_size, 1024 * 1024)
 
     def test_bundled_font_contains_distinct_traditional_chinese_glyphs(self) -> None:
         font = ImageTextComposer._load_font(72)
