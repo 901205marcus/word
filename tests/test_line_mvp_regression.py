@@ -629,7 +629,74 @@ class ServiceRegressionTests(unittest.TestCase):
 
         updated = self.service.overlay_store.get("retry-user")
         self.assertEqual(1, len(updated.pending_outputs))
-        self.assertIn("等待 LINE", updated.last_error)
+        self.assertIn("等待手動補送", updated.last_error)
+
+    def test_manual_overlay_retry_sends_one_saved_image(self) -> None:
+        self.service._handle_line_text("manual-retry-user", "user", "加字模式")
+        first = self.tempdir / "outputs" / "first.jpg"
+        second = self.tempdir / "outputs" / "second.jpg"
+        first.write_bytes(b"first")
+        second.write_bytes(b"second")
+        session = self.service.overlay_store.get("manual-retry-user")
+        session.pending_outputs = [str(first), str(second)]
+        self.service.overlay_store.update(session)
+
+        with patch.object(self.service, "_push_image_message", return_value=True) as push_mock:
+            reply = self.service._handle_line_text(
+                "manual-retry-user",
+                "user",
+                "補送圖片",
+            )
+
+        push_mock.assert_called_once_with("manual-retry-user", str(first))
+        self.assertIn("補送成功", reply)
+        self.assertIn("剩餘等待補送：1 張", reply)
+        updated = self.service.overlay_store.get("manual-retry-user")
+        self.assertEqual([str(second)], updated.pending_outputs)
+
+    def test_manual_overlay_retry_failure_keeps_saved_image(self) -> None:
+        self.service._handle_line_text("manual-fail-user", "user", "加字模式")
+        output = self.tempdir / "outputs" / "failed.jpg"
+        output.write_bytes(b"failed")
+        session = self.service.overlay_store.get("manual-fail-user")
+        session.pending_outputs = [str(output)]
+        self.service.overlay_store.update(session)
+
+        with patch.object(self.service, "_push_image_message", return_value=False):
+            reply = self.service._handle_line_text(
+                "manual-fail-user",
+                "user",
+                "重試回傳",
+            )
+
+        self.assertIn("補送失敗", reply)
+        updated = self.service.overlay_store.get("manual-fail-user")
+        self.assertEqual([str(output)], updated.pending_outputs)
+        self.assertIn("成品仍安全保留", updated.last_error)
+
+    def test_overlay_start_cleans_legacy_queue_and_missing_outputs(self) -> None:
+        session = self.service.overlay_store.get_or_create("legacy-user")
+        valid_output = self.tempdir / "outputs" / "valid.jpg"
+        valid_output.write_bytes(b"valid")
+        session.image_queue = [{"path": "old-image.jpg"}]
+        session.pending_outputs = [
+            str(self.tempdir / "outputs" / "missing.jpg"),
+            str(valid_output),
+        ]
+        self.service.overlay_store.update(session)
+
+        reply = self.service._handle_line_text("legacy-user", "user", "加字模式")
+
+        self.assertIn("舊版待處理照片 1 張", reply)
+        self.assertIn("失效成品 1 張", reply)
+        updated = self.service.overlay_store.get("legacy-user")
+        self.assertEqual([], updated.image_queue)
+        self.assertEqual([str(valid_output)], updated.pending_outputs)
+
+    def test_failed_overlay_choice_offers_manual_retry(self) -> None:
+        message = self.service._overlay_choice_message("圖片回傳失敗，等待補送。")
+        labels = [item["action"]["label"] for item in message["quickReply"]["items"]]
+        self.assertEqual(["補送圖片", "繼續貼字", "回到行程模式"], labels)
 
     def test_complete_overlay_batch_skips_settle_delay(self) -> None:
         self.service.overlay_image_settle_seconds = 2.0

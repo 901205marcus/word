@@ -40,6 +40,7 @@ class LineMVPService:
         "overlay_end",
         "overlay_cancel",
         "overlay_status",
+        "overlay_retry",
         "schedule_mode",
     }
 
@@ -566,6 +567,10 @@ class LineMVPService:
             "取消加字": "overlay_cancel",
             "/加字狀態": "overlay_status",
             "加字狀態": "overlay_status",
+            "/補送圖片": "overlay_retry",
+            "補送圖片": "overlay_retry",
+            "重試圖片": "overlay_retry",
+            "重試回傳": "overlay_retry",
             "查看": "view",
             "檢視": "view",
             "view": "view",
@@ -661,19 +666,26 @@ class LineMVPService:
     def _execute_overlay_command(self, sender_id: str, command: str) -> str:
         session = self.overlay_store.get_or_create(sender_id)
         self._prune_overlay_texts(session)
+        cleared_images, missing_outputs = self._clean_legacy_overlay_state(session)
 
         if command == "overlay_start":
             session.active = True
             session.updated_at = self._now_iso()
             session.last_error = ""
             self.overlay_store.update(session)
-            return (
+            lines = [
                 "已進入圖片加字模式，現在和行程功能完全分開。\n"
                 "步驟 1：先依順序傳完所有文字，每則 LINE 訊息算一段。\n"
                 "步驟 2：再依相同順序傳送照片。\n"
                 "配對規則：第 1 段文字＋第 1 張照片，依此類推。\n"
                 f"目前等待文字：{len(session.text_queue)} 段。完成後輸入「結束加字」。"
-            )
+            ]
+            if cleared_images or missing_outputs:
+                lines.append(
+                    f"系統整理：已清除舊版待處理照片 {cleared_images} 張、"
+                    f"失效成品 {missing_outputs} 張。"
+                )
+            return "\n".join(lines)
 
         if command == "overlay_continue":
             session.active = True
@@ -727,6 +739,35 @@ class LineMVPService:
                 "現在傳送的文字、圖片與 Word 會交給行程功能。"
             )
 
+        if command == "overlay_retry":
+            if not session.pending_outputs:
+                self.overlay_store.update(session)
+                return "目前沒有等待補送的圖片。可以繼續傳文字與照片。"
+
+            output_path = session.pending_outputs[0]
+            session.last_error = "正在手動補送第 1 張圖片"
+            session.updated_at = self._now_iso()
+            self.overlay_store.update(session)
+            if self._push_image_message(sender_id, output_path):
+                session.pending_outputs.pop(0)
+                session.last_error = ""
+                session.updated_at = self._now_iso()
+                self.overlay_store.update(session)
+                return (
+                    "圖片補送成功。\n"
+                    f"剩餘等待補送：{len(session.pending_outputs)} 張。\n"
+                    "系統沒有啟動背景重試；如仍有圖片，請再次輸入「補送圖片」。"
+                )
+
+            session.last_error = "手動補送失敗；成品仍安全保留"
+            session.updated_at = self._now_iso()
+            self.overlay_store.update(session)
+            return (
+                "圖片補送失敗，但成品沒有遺失。\n"
+                f"仍等待補送：{len(session.pending_outputs)} 張。\n"
+                "請稍後再次輸入「補送圖片」，不需要重新傳文字或照片。"
+            )
+
         mode = "加字模式" if session.active else "行程模式"
         lines = [
             f"目前模式：{mode}",
@@ -736,7 +777,30 @@ class LineMVPService:
         ]
         if session.last_error:
             lines.append(f"最後錯誤：{session.last_error}")
+        if cleared_images or missing_outputs:
+            lines.append(
+                f"系統整理：清除舊版待處理照片 {cleared_images} 張、"
+                f"失效成品 {missing_outputs} 張"
+            )
+        if session.pending_outputs:
+            lines.append("可輸入「補送圖片」單次重試，不會在背景自動重送。")
+        self.overlay_store.update(session)
         return "\n".join(lines)
+
+    @staticmethod
+    def _clean_legacy_overlay_state(session: OverlaySession) -> tuple[int, int]:
+        cleared_images = len(session.image_queue)
+        session.image_queue = []
+
+        valid_outputs: list[str] = []
+        missing_outputs = 0
+        for output_path in session.pending_outputs:
+            if Path(output_path).is_file():
+                valid_outputs.append(output_path)
+            else:
+                missing_outputs += 1
+        session.pending_outputs = valid_outputs
+        return cleared_images, missing_outputs
 
     def _start_apply_job(self, sender_id: str, message_id: str) -> None:
         with self._job_lock:
@@ -898,29 +962,40 @@ class LineMVPService:
 
     @staticmethod
     def _overlay_choice_message(text: str) -> dict[str, Any]:
+        actions = [
+            {
+                "type": "action",
+                "action": {
+                    "type": "message",
+                    "label": "繼續貼字",
+                    "text": "繼續貼字",
+                },
+            },
+            {
+                "type": "action",
+                "action": {
+                    "type": "message",
+                    "label": "回到行程模式",
+                    "text": "回到行程模式",
+                },
+            },
+        ]
+        if "回傳失敗" in text or "等待補送" in text:
+            actions.insert(
+                0,
+                {
+                    "type": "action",
+                    "action": {
+                        "type": "message",
+                        "label": "補送圖片",
+                        "text": "補送圖片",
+                    },
+                },
+            )
         return {
             "type": "text",
             "text": text[:5000],
-            "quickReply": {
-                "items": [
-                    {
-                        "type": "action",
-                        "action": {
-                            "type": "message",
-                            "label": "繼續貼字",
-                            "text": "繼續貼字",
-                        },
-                    },
-                    {
-                        "type": "action",
-                        "action": {
-                            "type": "message",
-                            "label": "回到行程模式",
-                            "text": "回到行程模式",
-                        },
-                    },
-                ]
-            },
+            "quickReply": {"items": actions},
         }
 
     def _push_text_message(self, to: str, text: str) -> bool:
@@ -1138,8 +1213,9 @@ class LineMVPService:
         session.last_error = ""
         pushed = self._push_image_message(sender_id, result_path)
         if not pushed:
-            session.pending_outputs.append(result_path)
-            session.last_error = f"第 {pair_number} 組已完成，等待 LINE 自動補送"
+            if result_path not in session.pending_outputs:
+                session.pending_outputs.append(result_path)
+            session.last_error = f"第 {pair_number} 組已完成，等待手動補送"
         self.overlay_store.update(session)
 
         lines = [
@@ -1149,7 +1225,10 @@ class LineMVPService:
         if pushed:
             lines.append("合成圖片已回傳；本組文字與照片不會再被使用。")
         else:
-            lines.append("圖片已完成但 LINE 回傳失敗，系統已保留成品等待補送。")
+            lines.append(
+                "圖片已完成但 LINE 回傳失敗，系統已保留成品；"
+                "請輸入「補送圖片」單次重試。"
+            )
         if delivered:
             lines.append(f"另外補送了先前等待中的圖片：{delivered} 張。")
         if expired:
