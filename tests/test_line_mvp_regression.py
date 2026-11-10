@@ -398,7 +398,7 @@ class ImageTextComposerTests(unittest.TestCase):
     def tearDown(self) -> None:
         shutil.rmtree(self.tempdir, ignore_errors=True)
 
-    def test_text_is_drawn_in_center_region(self) -> None:
+    def test_text_is_drawn_in_upper_center_without_dark_panel(self) -> None:
         source = self.tempdir / "source.jpg"
         output = self.tempdir / "result.jpg"
         background = (24, 80, 145)
@@ -409,11 +409,16 @@ class ImageTextComposerTests(unittest.TestCase):
         self.assertTrue(output.exists())
 
         with Image.open(output) as result:
-            center = result.crop((350, 220, 850, 580))
+            upper_center = result.crop((350, 120, 850, 450))
             corner = result.crop((0, 0, 120, 120))
-            center_colors = center.convert("RGB").getcolors(maxcolors=1_000_000)
+            upper_colors = upper_center.convert("RGB").getcolors(maxcolors=1_000_000)
             corner_colors = corner.convert("RGB").getcolors(maxcolors=1_000_000)
-            self.assertGreater(len(center_colors), len(corner_colors))
+            self.assertGreater(len(upper_colors), len(corner_colors))
+
+            colors = upper_center.convert("RGB").getcolors(maxcolors=1_000_000) or []
+            dark_pixels = sum(count for count, color in colors if max(color) < 45)
+            pixel_count = upper_center.width * upper_center.height
+            self.assertLess(dark_pixels / pixel_count, 0.16)
 
     def test_bundled_font_contains_distinct_traditional_chinese_glyphs(self) -> None:
         font = ImageTextComposer._load_font(72)
@@ -428,7 +433,7 @@ class ImageTextComposerTests(unittest.TestCase):
         source = self.tempdir / "portrait.png"
         output = self.tempdir / "portrait-result.jpg"
         Image.new("RGBA", (700, 1100), (180, 100, 80, 255)).save(source)
-        text = "這是一段比較長的文字，系統需要自動換行，而且仍然保持在照片正中央。"
+        text = "這是一段比較長的文字，系統需要自動換行，而且仍然保持在照片上方中央。"
         ImageTextComposer().compose(source, text, output)
         with Image.open(output) as result:
             self.assertEqual((700, 1100), result.size)

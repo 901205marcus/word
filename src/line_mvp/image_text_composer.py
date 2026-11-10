@@ -32,22 +32,10 @@ class ImageTextComposer:
 
         overlay = Image.new("RGBA", image.size, (0, 0, 0, 0))
         draw = ImageDraw.Draw(overlay)
-        font, lines, spacing, text_bbox = self._fit_text(draw, caption, width, height)
+        font, lines, spacing, _text_bbox = self._fit_text(draw, caption, width, height)
 
-        text_width = text_bbox[2] - text_bbox[0]
-        text_height = text_bbox[3] - text_bbox[1]
         center_x = width / 2
-        center_y = height / 2
-        padding_x = max(20, int(font.size * 0.55))
-        padding_y = max(16, int(font.size * 0.4))
-        box = (
-            int(center_x - text_width / 2 - padding_x),
-            int(center_y - text_height / 2 - padding_y),
-            int(center_x + text_width / 2 + padding_x),
-            int(center_y + text_height / 2 + padding_y),
-        )
-        radius = max(16, int(font.size * 0.35))
-        draw.rounded_rectangle(box, radius=radius, fill=(0, 0, 0, 120))
+        center_y = height * 0.36
 
         stroke_width = max(2, font.size // 18)
         draw.multiline_text(
@@ -74,8 +62,8 @@ class ImageTextComposer:
         height: int,
     ) -> tuple[ImageFont.FreeTypeFont, list[str], int, tuple[int, int, int, int]]:
         max_width = int(width * 0.82)
-        max_height = int(height * 0.68)
-        maximum = max(28, min(int(min(width, height) * 0.22), 220))
+        max_height = int(height * 0.48)
+        maximum = max(26, min(int(min(width, height) * 0.15), 160))
         minimum = max(18, min(width, height) // 30)
 
         for font_size in range(maximum, minimum - 1, -4):
@@ -105,7 +93,7 @@ class ImageTextComposer:
             stroke_width=max(2, minimum // 18),
         )
         if bbox[3] - bbox[1] > max_height:
-            raise ValueError("文字太長，無法完整放入照片中央，請縮短文字後重試。")
+            raise ValueError("文字太長，無法完整放入照片上方，請縮短文字後重試。")
         return font, lines, spacing, bbox
 
     def _wrap_text(
