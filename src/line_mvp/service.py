@@ -38,7 +38,7 @@ class LineMVPService:
         self.map_guidance = MapGuidanceGenerator()
         self.preview_renderer = DocxPreviewRenderer()
         self.image_text_composer = ImageTextComposer()
-        self.overlay_pair_seconds = max(60, int(os.getenv("OVERLAY_PAIR_SECONDS", "600")))
+        self.overlay_pair_seconds = max(60, int(os.getenv("OVERLAY_PAIR_SECONDS", "1800")))
 
         self.apply_retry_delay = max(3, int(os.getenv("LINE_APPLY_RETRY_DELAY", "5")))
         self.apply_retry_max_delay = max(
@@ -266,8 +266,8 @@ class LineMVPService:
             if message.get("type") == "image":
                 waiting = len(item.overlay_image_queue)
                 return (
-                    "圖片已收到，請在 10 分鐘內傳送這張照片的文字。\n"
-                    f"目前待配對照片：{waiting} 張。"
+                    "圖片已加入批次佇列；可以繼續一次傳完所有照片，再依序傳送文字。\n"
+                    f"目前待配對照片：{waiting} 張。配對保留時間：30 分鐘。"
                 )
             return f"附件已收到，但文字辨識失敗：{saved_path.name}\n錯誤：{exc}"
 
@@ -819,7 +819,7 @@ class LineMVPService:
             f"附件檔名：{filename}\n"
             f"目前累積行程：{len(item.actions)} 筆\n"
             f"若要看摘要，可回覆「查看 {code}」。\n"
-            "如果這是要加字的照片，請在 10 分鐘內傳送文字，系統會自動把大字放在照片正中央。"
+            "圖片加字可採批次傳送：先傳完所有照片，再依相同順序傳送所有文字。"
         )
 
     def _format_item_summary(self, item: InboxMessage) -> str:
@@ -867,7 +867,7 @@ class LineMVPService:
             "3. 略過 案件代碼\n"
             "4. 套用 案件代碼\n"
             "也可以直接傳新的行程文字、圖片、PDF、Word 模板給我。\n"
-            "圖片加字：照片與文字在 10 分鐘內先後傳送，會自動合成並回傳。"
+            "圖片加字：可先批次傳完照片，再批次傳文字；第 1 張配第 1 段，依序一對一回傳。"
         )
 
     def _retry_delay_seconds(self, attempt: int) -> int:

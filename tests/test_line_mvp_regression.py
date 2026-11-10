@@ -242,7 +242,8 @@ class ServiceRegressionTests(unittest.TestCase):
                 "user",
                 {"id": "image-2", "type": "image"},
             )
-        self.assertIn("請在 10 分鐘內", waiting_reply)
+        self.assertIn("批次佇列", waiting_reply)
+        self.assertIn("30 分鐘", waiting_reply)
 
         with patch.object(self.service, "_push_image_message", return_value=True):
             reply = self.service._handle_line_text("user-2", "user", "照片正中央")
@@ -250,7 +251,7 @@ class ServiceRegressionTests(unittest.TestCase):
         item = self.service.store.find_message("user-2")
         self.assertTrue(Path(item.overlay_output_path).exists())
 
-    def test_twenty_overlay_pairs_stay_one_to_one_in_order(self) -> None:
+    def test_twenty_batched_images_then_texts_stay_one_to_one_in_order(self) -> None:
         composed: list[tuple[bytes, str]] = []
 
         def fake_compose(image_path: str, text: str, output_path: Path) -> str:
@@ -279,6 +280,12 @@ class ServiceRegressionTests(unittest.TestCase):
                         "user",
                         {"id": f"image-{index}", "type": "image"},
                     )
+
+            waiting = self.service.store.find_message("bulk-user")
+            self.assertEqual(20, len(waiting.overlay_image_queue))
+            self.assertEqual([], waiting.overlay_text_queue)
+
+            for index in range(20):
                 self.service._handle_line_text(
                     "bulk-user",
                     "user",
