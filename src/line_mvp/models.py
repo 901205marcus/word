@@ -49,15 +49,18 @@ class InboxMessage:
     apply_attempts: int = 0
     last_error: str = ""
     last_progress_at: str = ""
-    overlay_text: str = ""
-    overlay_text_at: str = ""
-    overlay_image_path: str = ""
-    overlay_image_at: str = ""
-    overlay_output_path: str = ""
-    overlay_text_queue: list[dict[str, str]] = field(default_factory=list)
-    overlay_image_queue: list[dict[str, str]] = field(default_factory=list)
-    overlay_pending_outputs: list[str] = field(default_factory=list)
-    overlay_completed_count: int = 0
+
+
+@dataclass(slots=True)
+class OverlaySession:
+    sender_id: str
+    active: bool = False
+    text_queue: list[dict[str, str]] = field(default_factory=list)
+    pending_outputs: list[str] = field(default_factory=list)
+    completed_count: int = 0
+    output_path: str = ""
+    last_error: str = ""
+    updated_at: str = ""
 
 
 @dataclass(slots=True)

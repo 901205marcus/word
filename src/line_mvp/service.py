@@ -18,7 +18,8 @@ from .attachment_reader import AttachmentReader
 from .docx_preview import DocxPreviewRenderer
 from .image_text_composer import ImageTextComposer
 from .map_guidance import MapGuidanceGenerator
-from .models import InboxMessage, MessageStatus, ScheduleAction
+from .models import InboxMessage, MessageStatus, OverlaySession, ScheduleAction
+from .overlay_store import OverlaySessionStore
 from .parser import MessageParser
 from .storage import InboxStore
 from .word_editor import ScheduleWordEditor
@@ -26,6 +27,12 @@ from .word_editor import ScheduleWordEditor
 
 class LineMVPService:
     APPLYING_MARKER = "[APPLYING]"
+    OVERLAY_COMMANDS = {
+        "overlay_start",
+        "overlay_end",
+        "overlay_cancel",
+        "overlay_status",
+    }
 
     def __init__(self, base_dir: str | Path):
         self.base_dir = Path(base_dir)
@@ -33,6 +40,7 @@ class LineMVPService:
         self.output_dir = self.base_dir / "outputs"
         self.upload_dir = self.data_dir / "uploads"
         self.store = InboxStore(self.data_dir / "inbox.json")
+        self.overlay_store = OverlaySessionStore(self.data_dir / "overlay_sessions.json")
         self.parser = MessageParser(openai_enabled=True)
         self.attachment_reader = AttachmentReader(base_dir)
         self.map_guidance = MapGuidanceGenerator()
@@ -195,6 +203,22 @@ class LineMVPService:
 
     def _handle_line_text_locked(self, sender_id: str, source_type: str, raw_text: str) -> str:
         command, code = self._parse_line_command(raw_text)
+        if command in self.OVERLAY_COMMANDS:
+            return self._execute_line_command(sender_id, command, code)
+
+        overlay_session = self.overlay_store.get(sender_id)
+        if overlay_session and overlay_session.active:
+            self._prune_overlay_texts(overlay_session)
+            overlay_session.text_queue.append({"text": raw_text, "at": self._now_iso()})
+            overlay_session.updated_at = self._now_iso()
+            overlay_session.last_error = ""
+            self.overlay_store.update(overlay_session)
+            return (
+                f"加字文字已加入：第 {len(overlay_session.text_queue)} 段待配對。\n"
+                "可以繼續傳文字；全部文字傳完後，再按照相同順序傳送照片。\n"
+                "這段文字不會加入行程。"
+            )
+
         if command:
             return self._execute_line_command(sender_id, command, code)
 
@@ -205,14 +229,10 @@ class LineMVPService:
             item.raw_text = self._merge_text(item.raw_text, raw_text)
             item.last_progress_at = self._now_iso()
 
-        self._enqueue_overlay_text(item, raw_text)
         item.actions = self._enrich_actions(self.parser.parse(item.raw_text))
         item.error = ""
         item.last_error = ""
         self.store.update_message(item)
-        overlay_reply = self._try_create_overlay(sender_id, item)
-        if overlay_reply:
-            return overlay_reply
         return self._format_created_reply(item)
 
     def _handle_line_attachment(self, sender_id: str, source_type: str, message: dict[str, Any]) -> str:
@@ -229,6 +249,27 @@ class LineMVPService:
         if not message_id:
             return "沒有收到可下載的 LINE 附件編號。"
 
+        overlay_session = self.overlay_store.get(sender_id)
+        if overlay_session and overlay_session.active:
+            if message.get("type") != "image":
+                return "目前是加字模式，只接受照片。請輸入「結束加字」後再傳 Word 或其他附件。"
+            self._prune_overlay_texts(overlay_session)
+            if not overlay_session.text_queue:
+                self.overlay_store.update(overlay_session)
+                return (
+                    "目前沒有等待配對的文字，因此這張照片沒有加入佇列。\n"
+                    "請先傳送一段或多段文字，再依相同順序重新傳送照片。"
+                )
+
+            try:
+                content, content_type = self._download_line_message_content(message_id)
+            except Exception as exc:
+                return f"照片下載失敗，文字仍保留等待配對：{exc}"
+
+            filename = self._infer_line_filename(message, content_type)
+            saved_path = self._save_upload(filename, content)
+            return self._create_overlay_from_image(sender_id, overlay_session, saved_path)
+
         try:
             content, content_type = self._download_line_message_content(message_id)
         except Exception as exc:
@@ -243,13 +284,6 @@ class LineMVPService:
         item.uploaded_files.append(str(saved_path))
         item.last_progress_at = self._now_iso()
 
-        if message.get("type") == "image":
-            self._enqueue_overlay_image(item, str(saved_path))
-            self.store.update_message(item)
-            overlay_reply = self._try_create_overlay(sender_id, item)
-            if overlay_reply:
-                return overlay_reply
-
         if saved_path.suffix.lower() == ".docx":
             item.template_docx_path = str(saved_path)
             item.error = ""
@@ -263,12 +297,6 @@ class LineMVPService:
             item.error = str(exc)
             item.last_error = str(exc)
             self.store.update_message(item)
-            if message.get("type") == "image":
-                waiting = len(item.overlay_image_queue)
-                return (
-                    "圖片已加入批次佇列；可以繼續一次傳完所有照片，再依序傳送文字。\n"
-                    f"目前待配對照片：{waiting} 張。配對保留時間：30 分鐘。"
-                )
             return f"附件已收到，但文字辨識失敗：{saved_path.name}\n錯誤：{exc}"
 
         item.raw_text = self._merge_text(item.raw_text, f"[附件：{saved_path.name}]\n{extracted}")
@@ -324,6 +352,17 @@ class LineMVPService:
             "help": "help",
             "幫助": "help",
             "指令": "help",
+            "/加字": "overlay_start",
+            "加字模式": "overlay_start",
+            "開始加字": "overlay_start",
+            "圖片加字": "overlay_start",
+            "圖片加字模式": "overlay_start",
+            "/結束加字": "overlay_end",
+            "結束加字": "overlay_end",
+            "/取消加字": "overlay_cancel",
+            "取消加字": "overlay_cancel",
+            "/加字狀態": "overlay_status",
+            "加字狀態": "overlay_status",
             "查看": "view",
             "檢視": "view",
             "view": "view",
@@ -337,6 +376,9 @@ class LineMVPService:
         return aliases.get(command, ""), code
 
     def _execute_line_command(self, sender_id: str, command: str, code: str) -> str:
+        if command in self.OVERLAY_COMMANDS:
+            return self._execute_overlay_command(sender_id, command)
+
         if command == "help":
             return self._help_text()
 
@@ -409,6 +451,59 @@ class LineMVPService:
             )
 
         return self._help_text()
+
+    def _execute_overlay_command(self, sender_id: str, command: str) -> str:
+        session = self.overlay_store.get_or_create(sender_id)
+        self._prune_overlay_texts(session)
+
+        if command == "overlay_start":
+            session.active = True
+            session.updated_at = self._now_iso()
+            session.last_error = ""
+            self.overlay_store.update(session)
+            return (
+                "已進入圖片加字模式，現在和行程功能完全分開。\n"
+                "步驟 1：先依順序傳完所有文字，每則 LINE 訊息算一段。\n"
+                "步驟 2：再依相同順序傳送照片。\n"
+                "配對規則：第 1 段文字＋第 1 張照片，依此類推。\n"
+                f"目前等待文字：{len(session.text_queue)} 段。完成後輸入「結束加字」。"
+            )
+
+        if command == "overlay_cancel":
+            cleared = len(session.text_queue)
+            session.active = False
+            session.text_queue = []
+            session.last_error = ""
+            session.updated_at = self._now_iso()
+            self.overlay_store.update(session)
+            return f"已取消圖片加字並清空 {cleared} 段未配對文字，現在恢復行程模式。"
+
+        if command == "overlay_end":
+            session.active = False
+            session.updated_at = self._now_iso()
+            self.overlay_store.update(session)
+            waiting = len(session.text_queue)
+            suffix = (
+                f"尚有 {waiting} 段文字未配照片；再次輸入「加字模式」可繼續。"
+                if waiting
+                else "本批次已完成。"
+            )
+            return f"已結束圖片加字模式，現在恢復行程模式。\n{suffix}"
+
+        delivered = self._retry_overlay_outputs(sender_id, session)
+        self.overlay_store.update(session)
+        mode = "加字模式" if session.active else "行程模式"
+        lines = [
+            f"目前模式：{mode}",
+            f"等待照片的文字：{len(session.text_queue)} 段",
+            f"已完成圖片：{session.completed_count} 張",
+            f"等待 LINE 補送：{len(session.pending_outputs)} 張",
+        ]
+        if delivered:
+            lines.append(f"本次已補送：{delivered} 張")
+        if session.last_error:
+            lines.append(f"最後錯誤：{session.last_error}")
+        return "\n".join(lines)
 
     def _start_apply_job(self, sender_id: str, message_id: str) -> None:
         with self._job_lock:
@@ -518,118 +613,91 @@ class LineMVPService:
         with self._sender_locks_guard:
             return self._sender_locks.setdefault(sender_id, threading.RLock())
 
-    def _enqueue_overlay_text(self, item: InboxMessage, text: str) -> None:
-        self._migrate_overlay_queue(item)
-        item.overlay_text_queue.append({"text": text, "at": self._now_iso()})
-        self._sync_overlay_legacy_fields(item)
-
-    def _enqueue_overlay_image(self, item: InboxMessage, image_path: str) -> None:
-        self._migrate_overlay_queue(item)
-        item.overlay_image_queue.append({"path": image_path, "at": self._now_iso()})
-        self._sync_overlay_legacy_fields(item)
-
-    def _migrate_overlay_queue(self, item: InboxMessage) -> None:
-        if not item.overlay_text_queue and item.overlay_text.strip():
-            item.overlay_text_queue.append(
-                {"text": item.overlay_text, "at": item.overlay_text_at or self._now_iso()}
-            )
-        if not item.overlay_image_queue and item.overlay_image_path.strip():
-            item.overlay_image_queue.append(
-                {"path": item.overlay_image_path, "at": item.overlay_image_at or self._now_iso()}
-            )
-
-    @staticmethod
-    def _sync_overlay_legacy_fields(item: InboxMessage) -> None:
-        first_text = item.overlay_text_queue[0] if item.overlay_text_queue else {}
-        first_image = item.overlay_image_queue[0] if item.overlay_image_queue else {}
-        item.overlay_text = first_text.get("text", "")
-        item.overlay_text_at = first_text.get("at", "")
-        item.overlay_image_path = first_image.get("path", "")
-        item.overlay_image_at = first_image.get("at", "")
-
-    def _try_create_overlay(self, sender_id: str, item: InboxMessage) -> str:
-        self._migrate_overlay_queue(item)
-        delivered = self._retry_overlay_outputs(sender_id, item)
-        completed = 0
+    def _prune_overlay_texts(self, session: OverlaySession) -> int:
+        now = datetime.now()
+        valid: list[dict[str, str]] = []
         expired = 0
-        errors: list[str] = []
-
-        while item.overlay_text_queue and item.overlay_image_queue:
-            text_part = item.overlay_text_queue[0]
-            image_part = item.overlay_image_queue[0]
+        for part in session.text_queue:
             try:
-                text_time = datetime.fromisoformat(text_part["at"])
-                image_time = datetime.fromisoformat(image_part["at"])
-            except (KeyError, TypeError, ValueError):
-                item.overlay_text_queue.pop(0)
-                item.overlay_image_queue.pop(0)
-                expired += 1
-                continue
-
-            delta = (text_time - image_time).total_seconds()
-            if abs(delta) > self.overlay_pair_seconds:
-                if delta > 0:
-                    item.overlay_image_queue.pop(0)
+                created_at = datetime.fromisoformat(part["at"])
+                if (now - created_at).total_seconds() <= self.overlay_pair_seconds:
+                    valid.append(part)
                 else:
-                    item.overlay_text_queue.pop(0)
+                    expired += 1
+            except (KeyError, TypeError, ValueError):
                 expired += 1
-                continue
+        session.text_queue = valid
+        return expired
 
-            # Consume both inputs before rendering so neither can be reused by a later pair.
-            item.overlay_text_queue.pop(0)
-            item.overlay_image_queue.pop(0)
-            pair_number = item.overlay_completed_count + 1
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-            output_path = self.output_dir / (
-                f"line_overlay_{self._message_code(item).lower()}_{pair_number:04d}_{timestamp}.jpg"
+    def _create_overlay_from_image(
+        self,
+        sender_id: str,
+        session: OverlaySession,
+        image_path: Path,
+    ) -> str:
+        expired = self._prune_overlay_texts(session)
+        if not session.text_queue:
+            self.overlay_store.update(session)
+            return "等待配對的文字已逾時，請重新傳送文字後再傳照片。"
+
+        delivered = self._retry_overlay_outputs(sender_id, session)
+        text_part = session.text_queue.pop(0)
+        pair_number = session.completed_count + 1
+        sender_key = sha256(sender_id.encode("utf-8")).hexdigest()[:8]
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+        output_path = self.output_dir / (
+            f"line_overlay_{sender_key}_{pair_number:04d}_{timestamp}.jpg"
+        )
+        try:
+            result_path = self.image_text_composer.compose(
+                image_path,
+                text_part["text"],
+                output_path,
             )
-            try:
-                result_path = self.image_text_composer.compose(
-                    image_part["path"],
-                    text_part["text"],
-                    output_path,
-                )
-            except Exception as exc:
-                errors.append(f"第 {pair_number} 組合成失敗：{exc}")
-                continue
+        except Exception as exc:
+            session.last_error = f"第 {pair_number} 組合成失敗：{exc}"
+            session.updated_at = self._now_iso()
+            self.overlay_store.update(session)
+            return (
+                f"第 {pair_number} 組圖片文字合成失敗：{exc}\n"
+                "這段文字與照片已標記為同一組，不會拿去配下一張。"
+            )
 
-            item.overlay_output_path = result_path
-            item.overlay_completed_count = pair_number
-            item.last_progress_at = self._now_iso()
-            if self._push_image_message(sender_id, result_path):
-                completed += 1
-            else:
-                item.overlay_pending_outputs.append(result_path)
-                errors.append(f"第 {pair_number} 組已完成，等待 LINE 自動重送")
+        session.completed_count = pair_number
+        session.output_path = result_path
+        session.updated_at = self._now_iso()
+        session.last_error = ""
+        pushed = self._push_image_message(sender_id, result_path)
+        if not pushed:
+            session.pending_outputs.append(result_path)
+            session.last_error = f"第 {pair_number} 組已完成，等待 LINE 自動補送"
+        self.overlay_store.update(session)
 
-        self._sync_overlay_legacy_fields(item)
-        item.last_error = "\n".join(errors)
-        self.store.update_message(item)
-
-        messages: list[str] = []
-        if completed:
-            messages.append(f"一對一圖片合成完成：{completed} 組，已依順序回傳。")
+        lines = [
+            f"第 {pair_number} 組完成：第 {pair_number} 段文字已配第 {pair_number} 張照片。",
+            f"尚待照片：{len(session.text_queue)} 段文字。",
+        ]
+        if pushed:
+            lines.append("合成圖片已回傳；本組文字與照片不會再被使用。")
+        else:
+            lines.append("圖片已完成但 LINE 回傳失敗，系統已保留成品等待補送。")
         if delivered:
-            messages.append(f"先前待回傳圖片已補送：{delivered} 張。")
+            lines.append(f"另外補送了先前等待中的圖片：{delivered} 張。")
         if expired:
-            messages.append(f"已略過 {expired} 筆超過配對時間的資料。")
-        if errors:
-            messages.extend(errors)
-        if messages:
-            messages.append(
-                f"待配對：照片 {len(item.overlay_image_queue)} 張、文字 {len(item.overlay_text_queue)} 筆。"
-            )
-        return "\n".join(messages)
+            lines.append(f"已清除逾時文字：{expired} 段。")
+        if not session.text_queue:
+            lines.append("本批文字已全部配完，可輸入「結束加字」回到行程模式。")
+        return "\n".join(lines)
 
-    def _retry_overlay_outputs(self, sender_id: str, item: InboxMessage) -> int:
+    def _retry_overlay_outputs(self, sender_id: str, session: OverlaySession) -> int:
         delivered = 0
         still_pending: list[str] = []
-        for output_path in item.overlay_pending_outputs:
+        for output_path in session.pending_outputs:
             if self._push_image_message(sender_id, output_path):
                 delivered += 1
             else:
                 still_pending.append(output_path)
-        item.overlay_pending_outputs = still_pending
+        session.pending_outputs = still_pending
         return delivered
 
     def _push_image_message(self, to: str, image_path: str) -> bool:
@@ -819,7 +887,7 @@ class LineMVPService:
             f"附件檔名：{filename}\n"
             f"目前累積行程：{len(item.actions)} 筆\n"
             f"若要看摘要，可回覆「查看 {code}」。\n"
-            "圖片加字可採批次傳送：先傳完所有照片，再依相同順序傳送所有文字。"
+            "若要使用圖片加字，請先輸入「加字模式」；一般附件只會交給行程功能處理。"
         )
 
     def _format_item_summary(self, item: InboxMessage) -> str:
@@ -866,8 +934,12 @@ class LineMVPService:
             "2. 確認 案件代碼\n"
             "3. 略過 案件代碼\n"
             "4. 套用 案件代碼\n"
+            "5. 加字模式：進入獨立圖片加字功能\n"
+            "6. 加字狀態：查看待配對數量\n"
+            "7. 結束加字：返回行程模式\n"
+            "8. 取消加字：清空本批未配對文字\n"
             "也可以直接傳新的行程文字、圖片、PDF、Word 模板給我。\n"
-            "圖片加字：可先批次傳完照片，再批次傳文字；第 1 張配第 1 段，依序一對一回傳。"
+            "圖片加字必須先傳完文字，再傳照片；第 1 段配第 1 張，依序一對一回傳。"
         )
 
     def _retry_delay_seconds(self, attempt: int) -> int:

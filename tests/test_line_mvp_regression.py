@@ -208,8 +208,11 @@ class ServiceRegressionTests(unittest.TestCase):
         self.assertFalse(latest.processing)
         self.assertTrue(any("自動重試" in text for text in pushed))
 
-    def test_overlay_text_first_then_image(self) -> None:
-        self.service._handle_line_text("user-1", "user", "中央大標題")
+    def test_overlay_mode_text_first_then_image(self) -> None:
+        start_reply = self.service._handle_line_text("user-1", "user", "加字模式")
+        self.assertIn("已進入圖片加字模式", start_reply)
+        text_reply = self.service._handle_line_text("user-1", "user", "中央大標題")
+        self.assertIn("第 1 段待配對", text_reply)
         source = self.tempdir / "source.jpg"
         Image.new("RGB", (900, 600), (40, 90, 160)).save(source, format="JPEG")
         content = source.read_bytes()
@@ -223,35 +226,46 @@ class ServiceRegressionTests(unittest.TestCase):
                 {"id": "image-1", "type": "image"},
             )
 
-        self.assertIn("合成完成", reply)
-        item = self.service.store.find_message("user-1")
-        self.assertTrue(Path(item.overlay_output_path).exists())
-        self.assertEqual("", item.overlay_text)
-        self.assertEqual("", item.overlay_image_path)
+        self.assertIn("第 1 組完成", reply)
+        session = self.service.overlay_store.get("user-1")
+        self.assertTrue(Path(session.output_path).exists())
+        self.assertEqual([], session.text_queue)
+        self.assertIsNone(self.service.store.find_message("user-1"))
 
-    def test_overlay_image_first_then_text(self) -> None:
+    def test_overlay_mode_rejects_image_before_text(self) -> None:
+        self.service._handle_line_text("user-2", "user", "加字模式")
         source = self.tempdir / "source-first.jpg"
         Image.new("RGB", (800, 800), (90, 130, 70)).save(source, format="JPEG")
         content = source.read_bytes()
 
-        with patch.object(self.service, "_download_line_message_content", return_value=(content, "image/jpeg")), patch.object(
-            self.service.attachment_reader, "extract_text", side_effect=ValueError("no ocr")
-        ):
+        with patch.object(
+            self.service,
+            "_download_line_message_content",
+            return_value=(content, "image/jpeg"),
+        ) as download_mock:
             waiting_reply = self.service._handle_line_attachment(
                 "user-2",
                 "user",
                 {"id": "image-2", "type": "image"},
             )
-        self.assertIn("批次佇列", waiting_reply)
-        self.assertIn("30 分鐘", waiting_reply)
+        self.assertIn("請先傳送一段或多段文字", waiting_reply)
+        download_mock.assert_not_called()
 
-        with patch.object(self.service, "_push_image_message", return_value=True):
-            reply = self.service._handle_line_text("user-2", "user", "照片正中央")
-        self.assertIn("合成完成", reply)
-        item = self.service.store.find_message("user-2")
-        self.assertTrue(Path(item.overlay_output_path).exists())
+        text_reply = self.service._handle_line_text("user-2", "user", "照片正中央")
+        self.assertIn("第 1 段待配對", text_reply)
+        with patch.object(
+            self.service,
+            "_download_line_message_content",
+            return_value=(content, "image/jpeg"),
+        ), patch.object(self.service, "_push_image_message", return_value=True):
+            reply = self.service._handle_line_attachment(
+                "user-2",
+                "user",
+                {"id": "image-2-retry", "type": "image"},
+            )
+        self.assertIn("第 1 組完成", reply)
 
-    def test_twenty_batched_images_then_texts_stay_one_to_one_in_order(self) -> None:
+    def test_twenty_batched_texts_then_images_stay_one_to_one_in_order(self) -> None:
         composed: list[tuple[bytes, str]] = []
 
         def fake_compose(image_path: str, text: str, output_path: Path) -> str:
@@ -259,11 +273,18 @@ class ServiceRegressionTests(unittest.TestCase):
             Path(output_path).write_bytes(b"generated-jpeg")
             return str(output_path)
 
+        self.service._handle_line_text("bulk-user", "user", "加字模式")
+        for index in range(20):
+            self.service._handle_line_text(
+                "bulk-user",
+                "user",
+                f"第 {index + 1} 張照片的文字",
+            )
+
+        waiting = self.service.overlay_store.get("bulk-user")
+        self.assertEqual(20, len(waiting.text_queue))
+
         with patch.object(
-            self.service.attachment_reader,
-            "extract_text",
-            side_effect=ValueError("no ocr"),
-        ), patch.object(
             self.service.image_text_composer,
             "compose",
             side_effect=fake_compose,
@@ -281,62 +302,52 @@ class ServiceRegressionTests(unittest.TestCase):
                         {"id": f"image-{index}", "type": "image"},
                     )
 
-            waiting = self.service.store.find_message("bulk-user")
-            self.assertEqual(20, len(waiting.overlay_image_queue))
-            self.assertEqual([], waiting.overlay_text_queue)
-
-            for index in range(20):
-                self.service._handle_line_text(
-                    "bulk-user",
-                    "user",
-                    f"第 {index + 1} 張照片的文字",
-                )
-
         expected = [
             (f"unique-image-{index}".encode("ascii"), f"第 {index + 1} 張照片的文字")
             for index in range(20)
         ]
         self.assertEqual(expected, composed)
-        item = self.service.store.find_message("bulk-user")
-        self.assertEqual(20, item.overlay_completed_count)
-        self.assertEqual([], item.overlay_image_queue)
-        self.assertEqual([], item.overlay_text_queue)
+        session = self.service.overlay_store.get("bulk-user")
+        self.assertEqual(20, session.completed_count)
+        self.assertEqual([], session.text_queue)
 
-    def test_overlay_fifo_queues_never_overwrite_same_type(self) -> None:
-        composed: list[tuple[bytes, str]] = []
-
-        def fake_compose(image_path: str, text: str, output_path: Path) -> str:
-            composed.append((Path(image_path).read_bytes(), text))
-            Path(output_path).write_bytes(b"generated-jpeg")
-            return str(output_path)
-
-        with patch.object(
-            self.service.attachment_reader,
-            "extract_text",
-            side_effect=ValueError("no ocr"),
-        ), patch.object(
-            self.service.image_text_composer,
-            "compose",
-            side_effect=fake_compose,
-        ), patch.object(self.service, "_push_image_message", return_value=True):
-            for index in range(2):
-                with patch.object(
-                    self.service,
-                    "_download_line_message_content",
-                    return_value=(f"image-{index}".encode("ascii"), "image/jpeg"),
-                ):
-                    self.service._handle_line_attachment(
-                        "fifo-user",
-                        "user",
-                        {"id": f"fifo-{index}", "type": "image"},
-                    )
-            self.service._handle_line_text("fifo-user", "user", "第一段")
-            self.service._handle_line_text("fifo-user", "user", "第二段")
-
-        self.assertEqual(
-            [(b"image-0", "第一段"), (b"image-1", "第二段")],
-            composed,
+    def test_overlay_mode_is_separate_from_schedule_messages(self) -> None:
+        schedule_reply = self.service._handle_line_text(
+            "separate-user",
+            "user",
+            "7/20 10:00 原本行程",
         )
+        self.assertIn("案件代碼", schedule_reply)
+        item = self.service.store.find_message("separate-user")
+        original_raw_text = item.raw_text
+
+        self.service._handle_line_text("separate-user", "user", "加字模式")
+        self.service._handle_line_text("separate-user", "user", "確認")
+        unchanged = self.service.store.find_message("separate-user")
+        self.assertEqual(original_raw_text, unchanged.raw_text)
+        session = self.service.overlay_store.get("separate-user")
+        self.assertEqual("確認", session.text_queue[0]["text"])
+
+        end_reply = self.service._handle_line_text("separate-user", "user", "結束加字")
+        self.assertIn("恢復行程模式", end_reply)
+        self.service._handle_line_text("separate-user", "user", "7/21 11:00 新行程")
+        updated = self.service.store.find_message("separate-user")
+        self.assertIn("7/21 11:00 新行程", updated.raw_text)
+
+    def test_overlay_status_and_cancel_commands(self) -> None:
+        self.service._handle_line_text("control-user", "user", "加字模式")
+        self.service._handle_line_text("control-user", "user", "第一段文字")
+        self.service._handle_line_text("control-user", "user", "第二段文字")
+
+        status = self.service._handle_line_text("control-user", "user", "加字狀態")
+        self.assertIn("目前模式：加字模式", status)
+        self.assertIn("等待照片的文字：2 段", status)
+
+        cancelled = self.service._handle_line_text("control-user", "user", "取消加字")
+        self.assertIn("清空 2 段", cancelled)
+        session = self.service.overlay_store.get("control-user")
+        self.assertFalse(session.active)
+        self.assertEqual([], session.text_queue)
 
 
 class ImageTextComposerTests(unittest.TestCase):
