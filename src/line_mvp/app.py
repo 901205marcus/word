@@ -26,6 +26,7 @@ app.mount("/files", StaticFiles(directory=str(OUTPUT_DIR)), name="files")
 @app.on_event("startup")
 def startup_recover_jobs():
     service.recover_pending_jobs()
+    service.recover_overlay_jobs()
     threading.Thread(
         target=service.ensure_line_rich_menu,
         daemon=True,

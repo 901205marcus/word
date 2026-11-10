@@ -26,6 +26,8 @@ class OverlaySessionStore:
                 active=bool(raw.get("active", False)),
                 text_queue=list(raw.get("text_queue", [])),
                 seen_event_ids=list(raw.get("seen_event_ids", [])),
+                image_queue=list(raw.get("image_queue", [])),
+                seen_image_event_ids=list(raw.get("seen_image_event_ids", [])),
                 pending_outputs=list(raw.get("pending_outputs", [])),
                 completed_count=int(raw.get("completed_count", 0)),
                 output_path=raw.get("output_path", ""),
@@ -46,6 +48,11 @@ class OverlaySessionStore:
                 encoding="utf-8",
             )
             temp_path.replace(self.path)
+
+    def list_sessions(self) -> list[OverlaySession]:
+        with self._lock:
+            sender_ids = list(self._load())
+        return [session for sender_id in sender_ids if (session := self.get(sender_id)) is not None]
 
     def _load(self) -> dict:
         return json.loads(self.path.read_text(encoding="utf-8"))

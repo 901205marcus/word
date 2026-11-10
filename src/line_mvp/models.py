@@ -57,6 +57,8 @@ class OverlaySession:
     active: bool = False
     text_queue: list[dict[str, str]] = field(default_factory=list)
     seen_event_ids: list[str] = field(default_factory=list)
+    image_queue: list[dict[str, str]] = field(default_factory=list)
+    seen_image_event_ids: list[str] = field(default_factory=list)
     pending_outputs: list[str] = field(default_factory=list)
     completed_count: int = 0
     output_path: str = ""
