@@ -786,6 +786,34 @@ class ServiceRegressionTests(unittest.TestCase):
         updated = self.service.overlay_store.get("manual-retry-user")
         self.assertEqual([str(second)], updated.pending_outputs)
 
+    def test_overlay_retry_accepts_photo_word_and_removes_misqueued_command(self) -> None:
+        sender_id = "photo-word-retry-user"
+        self.service._handle_line_text(sender_id, "user", "加字模式")
+        session = self.service.overlay_store.get(sender_id)
+        session.text_queue = [
+            {
+                "text": "補送照片",
+                "at": datetime.now().isoformat(),
+                "event_timestamp": "1000",
+                "message_id": "101",
+                "event_id": "misqueued-command",
+            }
+        ]
+        output = self.tempdir / "outputs" / "saved-result.jpg"
+        output.write_bytes(b"saved-result")
+        session.pending_outputs = [str(output)]
+        self.service.overlay_store.update(session)
+
+        with patch.object(self.service, "_push_image_message", return_value=True) as push_mock:
+            reply = self.service._handle_line_text(sender_id, "user", "補送照片")
+
+        push_mock.assert_called_once_with(sender_id, str(output))
+        self.assertIn("已移除先前誤加入", reply)
+        self.assertIn("圖片補送成功", reply)
+        updated = self.service.overlay_store.get(sender_id)
+        self.assertEqual([], updated.text_queue)
+        self.assertEqual([], updated.pending_outputs)
+
     def test_manual_overlay_retry_failure_keeps_saved_image(self) -> None:
         self.service._handle_line_text("manual-fail-user", "user", "加字模式")
         output = self.tempdir / "outputs" / "failed.jpg"

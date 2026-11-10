@@ -609,6 +609,11 @@ class LineMVPService:
             "加字狀態": "overlay_status",
             "/補送圖片": "overlay_retry",
             "補送圖片": "overlay_retry",
+            "/補送照片": "overlay_retry",
+            "補送照片": "overlay_retry",
+            "補傳照片": "overlay_retry",
+            "重送照片": "overlay_retry",
+            "重傳照片": "overlay_retry",
             "重試圖片": "overlay_retry",
             "重試回傳": "overlay_retry",
             "/開始合成": "overlay_process",
@@ -788,14 +793,37 @@ class LineMVPService:
             )
 
         if command == "overlay_retry":
+            retry_words = {
+                "/補送圖片",
+                "補送圖片",
+                "/補送照片",
+                "補送照片",
+                "補傳照片",
+                "重送照片",
+                "重傳照片",
+                "重試圖片",
+                "重試回傳",
+            }
+            original_text_count = len(session.text_queue)
+            session.text_queue = [
+                part
+                for part in session.text_queue
+                if str(part.get("text", "")).strip() not in retry_words
+            ]
+            removed_command_texts = original_text_count - len(session.text_queue)
+            cleanup_note = (
+                f"已移除先前誤加入的補送指令文字：{removed_command_texts} 段。\n"
+                if removed_command_texts
+                else ""
+            )
             if not session.pending_outputs:
                 self.overlay_store.update(session)
                 if missing_outputs:
-                    return (
+                    return cleanup_note + (
                         f"檢查到 {missing_outputs} 張暫存成品已因服務重啟或部署而不存在。\n"
                         "請重新傳送該批文字與照片；新版本會使用獨立的小型預覽圖回傳。"
                     )
-                return "目前沒有等待補送的圖片。可以繼續傳文字與照片。"
+                return cleanup_note + "目前沒有等待補送的圖片。可以繼續傳文字與照片。"
 
             output_path = session.pending_outputs[0]
             session.last_error = "正在手動補送第 1 張圖片"
@@ -806,19 +834,19 @@ class LineMVPService:
                 session.last_error = ""
                 session.updated_at = self._now_iso()
                 self.overlay_store.update(session)
-                return (
+                return cleanup_note + (
                     "圖片補送成功。\n"
                     f"剩餘等待補送：{len(session.pending_outputs)} 張。\n"
-                    "系統沒有啟動背景重試；如仍有圖片，請再次輸入「補送圖片」。"
+                    "系統沒有啟動背景重試；如仍有圖片，請再次輸入「補送照片」。"
                 )
 
             session.last_error = "手動補送失敗；成品仍安全保留"
             session.updated_at = self._now_iso()
             self.overlay_store.update(session)
-            return (
+            return cleanup_note + (
                 "圖片補送失敗，但成品沒有遺失。\n"
                 f"仍等待補送：{len(session.pending_outputs)} 張。\n"
-                "請稍後再次輸入「補送圖片」，不需要重新傳文字或照片。"
+                "請稍後再次輸入「補送照片」，不需要重新傳文字或照片。"
             )
 
         if command == "overlay_process":
