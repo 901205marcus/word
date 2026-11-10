@@ -67,7 +67,7 @@ class ImageTextComposer:
         minimum = max(18, min(width, height) // 30)
 
         for font_size in range(maximum, minimum - 1, -4):
-            font = self._load_font(font_size)
+            font = self._load_font(font_size, text)
             lines = self._wrap_text(draw, text, font, max_width)
             spacing = max(6, font_size // 4)
             bbox = draw.multiline_textbbox(
@@ -81,7 +81,7 @@ class ImageTextComposer:
             if bbox[2] - bbox[0] <= max_width and bbox[3] - bbox[1] <= max_height:
                 return font, lines, spacing, bbox
 
-        font = self._load_font(minimum)
+        font = self._load_font(minimum, text)
         lines = self._wrap_text(draw, text, font, max_width)
         spacing = max(5, minimum // 4)
         bbox = draw.multiline_textbbox(
@@ -124,14 +124,19 @@ class ImageTextComposer:
         return lines or [""]
 
     @staticmethod
-    def _load_font(size: int) -> ImageFont.FreeTypeFont:
+    def _load_font(size: int, text: str = "勝光山中文") -> ImageFont.FreeTypeFont:
         configured = os.getenv("OVERLAY_FONT_PATH", "").strip()
-        bundled = Path(__file__).resolve().parents[2] / "assets" / "NotoSansTC.ttf"
+        assets_dir = Path(__file__).resolve().parents[2] / "assets"
+        bundled_tc = assets_dir / "NotoSansTC.ttf"
+        bundled_sc = assets_dir / "NotoSansSC.ttf"
         candidates = [
             configured,
-            str(bundled),
+            str(bundled_tc),
+            str(bundled_sc),
             r"C:\Windows\Fonts\msjhbd.ttc",
             r"C:\Windows\Fonts\msjh.ttc",
+            r"C:\Windows\Fonts\msyhbd.ttc",
+            r"C:\Windows\Fonts\msyh.ttc",
             r"C:\Windows\Fonts\mingliu.ttc",
             "/usr/share/fonts/opentype/noto/NotoSansCJK-Bold.ttc",
             "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
@@ -149,16 +154,24 @@ class ImageTextComposer:
                     font.set_variation_by_name("Bold")
                 except (OSError, ValueError):
                     pass
-                if ImageTextComposer._font_supports_cjk(font):
+                if ImageTextComposer._font_supports_text(font, text):
                     return font
             except (OSError, ValueError):
                 continue
-        raise RuntimeError("找不到支援繁體中文的字型，請設定 OVERLAY_FONT_PATH。")
+        raise RuntimeError("找不到能完整顯示這段文字的中文字型，請縮短文字或設定 OVERLAY_FONT_PATH。")
+
+    @staticmethod
+    def _font_supports_text(font: ImageFont.FreeTypeFont, text: str) -> bool:
+        missing_mask = font.getmask("\U0010ffff")
+        missing_signature = (missing_mask.size, bytes(missing_mask))
+        for character in set(text):
+            if character.isspace():
+                continue
+            mask = font.getmask(character)
+            if (mask.size, bytes(mask)) == missing_signature:
+                return False
+        return True
 
     @staticmethod
     def _font_supports_cjk(font: ImageFont.FreeTypeFont) -> bool:
-        signatures = []
-        for character in "勝光山中文":
-            mask = font.getmask(character)
-            signatures.append((mask.size, bytes(mask)))
-        return len(set(signatures)) >= 4
+        return ImageTextComposer._font_supports_text(font, "勝光山中文")

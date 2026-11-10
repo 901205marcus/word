@@ -429,6 +429,17 @@ class ImageTextComposerTests(unittest.TestCase):
             signatures.append((mask.size, bytes(mask)))
         self.assertEqual(3, len(set(signatures)))
 
+    def test_simplified_chinese_uses_a_font_without_missing_glyph_boxes(self) -> None:
+        font = ImageTextComposer._load_font(72, "红花")
+        self.assertTrue(ImageTextComposer._font_supports_text(font, "红花"))
+        self.assertEqual("NotoSansSC.ttf", Path(font.path).name)
+
+        source = self.tempdir / "simplified-source.jpg"
+        output = self.tempdir / "simplified-result.jpg"
+        Image.new("RGB", (900, 1200), (80, 120, 160)).save(source)
+        ImageTextComposer().compose(source, "红花", output)
+        self.assertTrue(output.exists())
+
     def test_long_text_wraps_without_exceeding_canvas(self) -> None:
         source = self.tempdir / "portrait.png"
         output = self.tempdir / "portrait-result.jpg"
